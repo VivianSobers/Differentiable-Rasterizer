@@ -1,0 +1,186 @@
+"""Tests for the PyTorch layer.
+
+Skipped wholesale when torch or the compiled extension is absent, so the rest
+of the Python suite still runs on a machine without them.
+"""
+
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:
+    import torch
+    import torch.nn.functional as F
+
+    from diffrast.torch_layer import (
+        N_PARAMS,
+        clamp_params,
+        fused_loss,
+        psnr,
+        random_params,
+        rasterize,
+    )
+
+    HAVE_TORCH = True
+except ImportError:  # pragma: no cover - environment-dependent
+    HAVE_TORCH = False
+
+
+@unittest.skipUnless(HAVE_TORCH, "torch or diffrast_rs not installed")
+class TestRasterize(unittest.TestCase):
+    def test_output_shape_and_layout(self) -> None:
+        p = random_params(3, 8, generator=torch.Generator().manual_seed(0))
+        self.assertEqual(rasterize(p, 16, 24).shape, (3, 3, 16, 24))
+        self.assertEqual(
+            rasterize(p, 16, 24, channels_first=False).shape, (3, 16, 24, 3)
+        )
+
+    def test_render_is_differentiable(self) -> None:
+        p = random_params(1, 4, generator=torch.Generator().manual_seed(0))
+        p.requires_grad_(True)
+        rasterize(p, 16, 16, sigma=0.03).sum().backward()
+
+        self.assertIsNotNone(p.grad)
+        self.assertEqual(p.grad.shape, p.shape)
+        self.assertTrue(torch.isfinite(p.grad).all())
+        self.assertGreater(p.grad.abs().sum(), 0, "gradient should not be identically zero")
+
+    def test_gradient_matches_numerical_differentiation(self) -> None:
+        """The load-bearing test: Rust's analytic gradient vs torch's own.
+
+        `eps` is deliberately 5e-4. Finite-difference error is U-shaped —
+        smaller steps drown in float32 cancellation, larger ones measure the
+        function's curvature rather than its slope. This value sits at the
+        bottom of that curve for this loss scale.
+        """
+        eps = 5e-4
+        sigma = 0.03
+        gen = torch.Generator().manual_seed(0)
+        p = random_params(1, 5, generator=gen).requires_grad_(True)
+        target = torch.rand(1, 3, 24, 24, generator=torch.Generator().manual_seed(1))
+
+        loss = F.mse_loss(rasterize(p, 24, 24, sigma=sigma), target)
+        loss.backward()
+        analytic = p.grad.clone()
+
+        numeric = torch.zeros_like(p)
+        flat = numeric.view(-1)
+        with torch.no_grad():
+            base = p.detach().clone()
+            for i in range(base.numel()):
+                for sign in (1, -1):
+                    probe = base.clone().view(-1)
+                    probe[i] += sign * eps
+                    flat[i] += sign * F.mse_loss(
+                        rasterize(probe.view_as(base), 24, 24, sigma=sigma), target
+                    )
+            flat /= 2 * eps
+
+        rel = ((analytic - numeric).norm() / numeric.norm()).item()
+        cos = F.cosine_similarity(analytic.view(1, -1), numeric.view(1, -1)).item()
+        self.assertLess(rel, 0.02, f"relative error {rel:.4%}")
+        self.assertGreater(cos, 0.999, f"cosine similarity {cos:.6f}")
+
+    def test_gradient_descent_reduces_loss(self) -> None:
+        """End-to-end: optimizing through the layer must actually work."""
+        gen = torch.Generator().manual_seed(3)
+        target = rasterize(random_params(1, 6, generator=gen), 32, 32, sigma=0.002).detach()
+
+        p = random_params(1, 6, generator=torch.Generator().manual_seed(9))
+        p.requires_grad_(True)
+        opt = torch.optim.Adam([p], lr=0.02)
+
+        first = None
+        for _ in range(60):
+            opt.zero_grad()
+            loss = F.mse_loss(rasterize(p, 32, 32, sigma=0.03), target)
+            loss.backward()
+            opt.step()
+            with torch.no_grad():
+                p.copy_(clamp_params(p))
+            if first is None:
+                first = loss.item()
+
+        self.assertLess(loss.item(), first * 0.7, f"loss {first} -> {loss.item()}")
+
+    def test_gradients_reach_an_upstream_network(self) -> None:
+        """The point of the whole layer: a network trains through the render."""
+        net = torch.nn.Linear(4, 6 * N_PARAMS)
+        latent = torch.randn(2, 4)
+        params = net(latent).view(2, 6, N_PARAMS)
+
+        rasterize(params, 16, 16, sigma=0.03).mean().backward()
+
+        self.assertIsNotNone(net.weight.grad)
+        self.assertTrue(torch.isfinite(net.weight.grad).all())
+        self.assertGreater(net.weight.grad.abs().sum(), 0)
+
+    def test_rejects_bad_shapes_and_sigma(self) -> None:
+        p = random_params(1, 4, generator=torch.Generator().manual_seed(0))
+        with self.assertRaises(ValueError):
+            rasterize(p[..., :4], 16, 16)
+        with self.assertRaises(ValueError):
+            rasterize(p, 0, 16)
+        with self.assertRaises(ValueError):
+            rasterize(p, 16, 16, sigma=0.0)
+
+    def test_background_is_visible_where_nothing_is_drawn(self) -> None:
+        # A single degenerate triangle far off-canvas leaves the background.
+        p = torch.tensor([[[5.0, 5.0, 5.1, 5.0, 5.05, 5.1, 1.0, 1.0, 1.0, 1.0]]])
+        img = rasterize(p, 8, 8, background=(0.25, 0.5, 0.75))
+        self.assertAlmostEqual(img[0, 0].mean().item(), 0.25, places=5)
+        self.assertAlmostEqual(img[0, 2].mean().item(), 0.75, places=5)
+
+
+@unittest.skipUnless(HAVE_TORCH, "torch or diffrast_rs not installed")
+class TestFusedLoss(unittest.TestCase):
+    def test_matches_autograd_path(self) -> None:
+        gen = torch.Generator().manual_seed(0)
+        p = random_params(2, 5, generator=gen)
+        targets = torch.rand(2, 20, 20, 3, generator=torch.Generator().manual_seed(1))
+
+        losses, grads = fused_loss(p, targets, sigma=0.03)
+
+        pg = p.clone().requires_grad_(True)
+        rendered = rasterize(pg, 20, 20, sigma=0.03, channels_first=False)
+        # Per-item MSE, matching what the fused path reports.
+        per_item = ((rendered - targets) ** 2).flatten(1).mean(1)
+        per_item.sum().backward()
+
+        torch.testing.assert_close(losses, per_item.detach(), rtol=1e-4, atol=1e-6)
+        torch.testing.assert_close(grads, pg.grad, rtol=1e-3, atol=1e-7)
+
+    def test_rejects_bad_target_shape(self) -> None:
+        p = random_params(1, 4, generator=torch.Generator().manual_seed(0))
+        with self.assertRaises(ValueError):
+            fused_loss(p, torch.rand(1, 3, 8, 8, 1))
+
+
+@unittest.skipUnless(HAVE_TORCH, "torch or diffrast_rs not installed")
+class TestHelpers(unittest.TestCase):
+    def test_random_params_are_in_range(self) -> None:
+        p = random_params(4, 10, generator=torch.Generator().manual_seed(0))
+        self.assertEqual(p.shape, (4, 10, N_PARAMS))
+        self.assertTrue((p[..., 6:9] >= 0).all() and (p[..., 6:9] <= 1).all())
+        self.assertTrue((p[..., 9] > 0).all() and (p[..., 9] < 1).all())
+
+    def test_clamp_keeps_alpha_off_the_boundary(self) -> None:
+        p = torch.full((1, 1, N_PARAMS), 5.0)
+        p[..., 9] = 1.0
+        out = clamp_params(p)
+        self.assertLess(out[0, 0, 9].item(), 1.0, "alpha at exactly 1 gets no gradient")
+        self.assertGreater(out[0, 0, 9].item(), 0.0)
+        self.assertLessEqual(out[0, 0, 0].item(), 1.25)
+
+    def test_psnr_is_infinite_for_identical_images(self) -> None:
+        a = torch.rand(1, 3, 8, 8)
+        self.assertTrue(torch.isinf(psnr(a, a)))
+        self.assertGreater(psnr(a, a * 0.99).item(), 20.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
