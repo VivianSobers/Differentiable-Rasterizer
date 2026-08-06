@@ -1,110 +1,214 @@
 //! Fits a triangle scene to a target image by gradient descent.
-//!
-//! ```text
-//! cargo run --release --bin fit -- target.png [options]
-//!
-//!   --tris N          triangles in the scene      (default 128)
-//!   --iters N         optimizer steps             (default 1500)
-//!   --size N          fit resolution              (default 192)
-//!   --out DIR         output directory            (default out)
-//!   --save-every N    write a frame every N iters (default 0, off)
-//!   --export N        final render resolution     (default 1024)
-//!   --seed N          RNG seed                    (default 0)
-//! ```
-//!
-//! With no target path, a synthetic one is generated — useful as a smoke test
-//! when you just want to watch the loop run.
 
+use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use diffrast::raster::{coverage, pixel_center};
-use diffrast::{fit, render, Canvas, FitConfig, RenderParams, Triangle};
+use diffrast::{
+    fit, fit_within, render, scene_to_json, Canvas, FitConfig, RenderParams, StopReason, Triangle,
+};
+
+const USAGE: &str = "\
+fit — reconstruct an image from soft triangles
+
+usage: fit [target image] [options]
+
+  --tris N          triangles in the scene        (default 128)
+  --iters N         optimizer steps               (default 1500)
+  --size N          longest side of the fit       (default 192)
+  --out DIR         output directory              (default out)
+  --save-every N    write a frame every N iters   (default 0, off)
+  --export N        longest side of final render  (default 1024)
+  --seed N          RNG seed                      (default 0)
+  --patience N      stop after N stalled iters    (default 250, 0 disables)
+  --quiet           suppress per-iteration output
+  --help            show this message
+
+With no target image, a synthetic one is generated.";
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let target_path = args.first().filter(|a| !a.starts_with("--")).cloned();
-
-    let flag = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
-    };
-    let num = |name: &str, default: usize| -> usize {
-        flag(name).and_then(|v| v.parse().ok()).unwrap_or(default)
-    };
-
-    let cfg = FitConfig {
-        triangles: num("--tris", 128),
-        iters: num("--iters", 1500),
-        size: num("--size", 192),
-        seed: num("--seed", 0) as u64,
-        ..Default::default()
-    };
-    let out_dir = PathBuf::from(flag("--out").unwrap_or_else(|| "out".to_string()));
-    let save_every = num("--save-every", 0);
-    let export = num("--export", 1024);
-
-    let target = match &target_path {
-        Some(path) => Canvas::load_image(path, cfg.size, cfg.size)
-            .unwrap_or_else(|e| panic!("failed to load {path}: {e}")),
-        None => synthetic_target(cfg.size),
-    };
-
-    std::fs::create_dir_all(&out_dir).expect("failed to create output directory");
-    let frames_dir = out_dir.join("frames");
-    if save_every > 0 {
-        std::fs::create_dir_all(&frames_dir).expect("failed to create frames directory");
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     }
-    target.save_png(out_dir.join("target.png")).expect("failed to write target");
+}
+
+struct Args {
+    target: Option<String>,
+    cfg: FitConfig,
+    size: usize,
+    out_dir: PathBuf,
+    save_every: usize,
+    export: usize,
+    quiet: bool,
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let Some(args) = parse_args(std::env::args().skip(1).collect())? else {
+        println!("{USAGE}");
+        return Ok(());
+    };
+
+    let target = load_target(args.target.as_deref(), args.size)?;
+    let out_dir = &args.out_dir;
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
+
+    let frames_dir = out_dir.join("frames");
+    if args.save_every > 0 {
+        std::fs::create_dir_all(&frames_dir)
+            .map_err(|e| format!("cannot create {}: {e}", frames_dir.display()))?;
+    }
+    target.save_png(out_dir.join("target.png"))?;
 
     println!(
         "fitting {} triangles to {} at {}x{} for {} iters",
-        cfg.triangles,
-        target_path.as_deref().unwrap_or("<synthetic target>"),
-        cfg.size,
-        cfg.size,
-        cfg.iters
+        args.cfg.triangles,
+        args.target.as_deref().unwrap_or("<synthetic target>"),
+        target.width,
+        target.height,
+        args.cfg.iters
     );
 
     let start = std::time::Instant::now();
-    let report = fit(&target, &cfg, |p| {
-        if p.iter % 100 == 0 || p.iter + 1 == cfg.iters {
+    let mut frame_error = None;
+    let report = fit(&target, &args.cfg, |p| {
+        if !args.quiet && (p.iter % 100 == 0 || p.iter + 1 == args.cfg.iters) {
             println!("  iter {:>5}  loss {:.6}  sigma {:.5}", p.iter, p.loss, p.sigma);
         }
-        if save_every > 0 && p.iter % save_every == 0 {
-            let rp = RenderParams::new(cfg.size, cfg.size, p.sigma);
-            let path = frames_dir.join(format!("frame_{:05}.png", p.iter / save_every));
-            let _ = render(p.scene, rp).save_png(path);
+        if args.save_every > 0 && p.iter % args.save_every == 0 && frame_error.is_none() {
+            let rp = RenderParams::new(target.width, target.height, p.sigma);
+            let path = frames_dir.join(format!("frame_{:05}.png", p.iter / args.save_every));
+            // Recorded rather than unwrapped: losing a frame should not throw
+            // away a fit that may have been running for minutes.
+            if let Err(e) = render(p.scene, rp).save_png(path) {
+                frame_error = Some(e.to_string());
+            }
         }
-    });
+    })?;
     let elapsed = start.elapsed();
 
-    // Re-render large. Geometry is in normalized space, so the fitted scene
-    // upscales without refitting — the payoff of resolution-independent
-    // parameters is that you optimize small and export sharp.
-    let sharp = RenderParams::new(export, export, cfg.sigma_end * cfg.size as f32 / export as f32);
-    render(&report.scene, sharp)
-        .save_png(out_dir.join("fit.png"))
-        .expect("failed to write fit");
+    if let Some(e) = frame_error {
+        eprintln!("warning: frame export stopped early: {e}");
+    }
 
-    write_loss_csv(&out_dir.join("loss.csv"), &report.losses);
+    // Re-render large. Geometry is normalized, so the fitted scene upscales
+    // without refitting — optimize small, export sharp.
+    let (ew, eh) = scale_to(target.width, target.height, args.export);
+    let sharp = RenderParams::new(ew, eh, args.cfg.sigma_end * target.width as f32 / ew as f32);
+    render(&report.scene, sharp).save_png(out_dir.join("fit.png"))?;
 
-    let first = report.losses.first().copied().unwrap_or(f32::NAN);
+    write_loss_csv(&out_dir.join("loss.csv"), &report.losses)?;
+    std::fs::write(out_dir.join("scene.json"), scene_to_json(&report.scene))?;
+
+    let note = match report.stop_reason {
+        StopReason::Completed => "completed",
+        StopReason::Converged => "converged early",
+        StopReason::Diverged => "DIVERGED — returning best scene so far",
+    };
     println!(
-        "\ndone in {:.2?}  loss {:.6} -> {:.6}  ({:.1}x lower)\nwrote {}",
-        elapsed,
-        first,
-        report.final_loss(),
-        first / report.final_loss(),
+        "\n{note} in {elapsed:.2?} after {} iters\nloss {:.6} -> {:.6} ({:.1}x lower, best at iter {})\nwrote {}",
+        report.losses.len(),
+        report.initial_loss(),
+        report.best_loss,
+        report.improvement(),
+        report.best_iter,
         out_dir.join("fit.png").display()
     );
+    Ok(())
 }
 
-fn write_loss_csv(path: &Path, losses: &[f32]) {
+/// Returns `Ok(None)` when the user asked for help.
+fn parse_args(args: Vec<String>) -> Result<Option<Args>, Box<dyn Error>> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(None);
+    }
+
+    let target = args.first().filter(|a| !a.starts_with('-')).cloned();
+    let mut cfg = FitConfig::default();
+    let mut size = 192;
+    let mut out_dir = PathBuf::from("out");
+    let mut save_every = 0;
+    let mut export = 1024;
+    let mut quiet = false;
+
+    let mut i = if target.is_some() { 1 } else { 0 };
+    while i < args.len() {
+        let flag = &args[i];
+        // Every flag but --quiet takes a value; missing values are reported
+        // rather than silently defaulted, since a typo would otherwise run a
+        // long fit with settings the user did not ask for.
+        let value = || -> Result<String, String> {
+            args.get(i + 1)
+                .cloned()
+                .filter(|v| !v.starts_with("--"))
+                .ok_or_else(|| format!("{flag} requires a value"))
+        };
+
+        match flag.as_str() {
+            "--quiet" => {
+                quiet = true;
+                i += 1;
+                continue;
+            }
+            "--tris" => cfg.triangles = parse_num(flag, &value()?)?,
+            "--iters" => cfg.iters = parse_num(flag, &value()?)?,
+            "--size" => size = parse_num(flag, &value()?)?,
+            "--seed" => cfg.seed = parse_num(flag, &value()?)? as u64,
+            "--export" => export = parse_num(flag, &value()?)?,
+            "--save-every" => save_every = parse_num(flag, &value()?)?,
+            "--patience" => {
+                let n: usize = parse_num(flag, &value()?)?;
+                cfg.patience = (n > 0).then_some(n);
+            }
+            "--out" => out_dir = PathBuf::from(value()?),
+            other => return Err(format!("unknown option {other}\n\n{USAGE}").into()),
+        }
+        i += 2;
+    }
+
+    if size == 0 {
+        return Err("--size must be greater than zero".into());
+    }
+    if export == 0 {
+        return Err("--export must be greater than zero".into());
+    }
+    cfg.validate()?;
+
+    Ok(Some(Args { target, cfg, size, out_dir, save_every, export, quiet }))
+}
+
+fn parse_num(flag: &str, raw: &str) -> Result<usize, String> {
+    raw.parse().map_err(|_| format!("{flag} expects a non-negative integer, got '{raw}'"))
+}
+
+fn load_target(path: Option<&str>, size: usize) -> Result<Canvas, Box<dyn Error>> {
+    let Some(path) = path else { return Ok(synthetic_target(size)) };
+
+    if !Path::new(path).exists() {
+        return Err(format!("no such file: {path}").into());
+    }
+    // Probe the real dimensions first so the resize preserves aspect ratio
+    // instead of squashing the image into a square.
+    let (w, h) = image::image_dimensions(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let (tw, th) = fit_within(w as usize, h as usize, size);
+    Canvas::load_image(path, tw, th).map_err(|e| format!("cannot decode {path}: {e}").into())
+}
+
+/// Scale `(w, h)` so the longest side is `target`, in either direction.
+fn scale_to(w: usize, h: usize, target: usize) -> (usize, usize) {
+    let scale = target as f64 / w.max(h) as f64;
+    (((w as f64 * scale).round() as usize).max(1), ((h as f64 * scale).round() as usize).max(1))
+}
+
+fn write_loss_csv(path: &Path, losses: &[f32]) -> Result<(), Box<dyn Error>> {
     use std::fmt::Write as _;
     let mut csv = String::from("iter,loss\n");
     for (i, l) in losses.iter().enumerate() {
         let _ = writeln!(csv, "{i},{l}");
     }
-    std::fs::write(path, csv).expect("failed to write loss csv");
+    std::fs::write(path, csv).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(())
 }
 
 /// A target with a smooth gradient plus hard-edged shapes — the two things a
@@ -119,9 +223,8 @@ fn synthetic_target(size: usize) -> Canvas {
         }
     }
 
-    // Composite hard-edged shapes over the gradient. Done by hand rather than
-    // with `render`, because a Scene clears to a flat background color and
-    // would wipe out the gradient underneath.
+    // Composited by hand rather than with `render`, because a Scene clears to a
+    // flat background color and would wipe out the gradient underneath.
     let shapes = [
         Triangle::new([[0.15, 0.70], [0.55, 0.68], [0.35, 0.20]], [0.95, 0.85, 0.25], 1.0),
         Triangle::new([[0.50, 0.30], [0.88, 0.45], [0.62, 0.85]], [0.10, 0.25, 0.45], 1.0),
