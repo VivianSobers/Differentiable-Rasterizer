@@ -17,3 +17,7 @@ path = "src/bin/render.rs"
 [[bin]]
 name = "fit"
 path = "src/bin/fit.rs"
+
+[[bench]]
+name = "raster"
+harness = false
