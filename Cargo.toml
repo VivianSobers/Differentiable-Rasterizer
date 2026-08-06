@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/diffrast"]
+members = ["crates/diffrast", "crates/diffrast-wasm"]
 resolver = "2"
 
 [workspace.package]
