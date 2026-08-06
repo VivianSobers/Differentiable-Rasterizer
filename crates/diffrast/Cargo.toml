@@ -1,0 +1,14 @@
+[package]
+name = "diffrast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Differentiable 2D triangle rasterizer"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+rand = "0.8"
+
+[[bin]]
+name = "render"
+path = "src/bin/render.rs"
