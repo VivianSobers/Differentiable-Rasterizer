@@ -13,9 +13,11 @@ pub mod grad;
 pub mod optim;
 pub mod raster;
 pub mod scene;
+pub mod serial;
 
-pub use canvas::Canvas;
-pub use fit::{fit, FitConfig, FitProgress, FitReport};
+pub use canvas::{fit_within, Canvas};
+pub use fit::{fit, ConfigError, FitConfig, FitProgress, FitReport, StopReason};
+pub use serial::scene_to_json;
 pub use grad::{backward, finite_difference, render_with_tape, Tape};
 pub use optim::Adam;
 pub use raster::{render, RenderParams};
