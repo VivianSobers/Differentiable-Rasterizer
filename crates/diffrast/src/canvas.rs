@@ -86,6 +86,16 @@ impl Canvas {
     }
 }
 
+/// Scale `(w, h)` down so neither side exceeds `max`, preserving aspect ratio.
+/// Never scales up, and never returns a zero dimension.
+pub fn fit_within(w: usize, h: usize, max: usize) -> (usize, usize) {
+    if max == 0 || w == 0 || h == 0 || (w <= max && h <= max) {
+        return (w.max(1), h.max(1));
+    }
+    let scale = max as f64 / w.max(h) as f64;
+    (((w as f64 * scale).round() as usize).max(1), ((h as f64 * scale).round() as usize).max(1))
+}
+
 #[inline]
 fn encode_srgb(v: f32) -> u8 {
     let v = v.clamp(0.0, 1.0);
@@ -100,5 +110,50 @@ fn decode_srgb(v: u8) -> f32 {
         v / 12.92
     } else {
         ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn srgb_round_trips_through_encode_decode() {
+        for v in [0u8, 1, 17, 128, 200, 255] {
+            let back = encode_srgb(decode_srgb(v));
+            assert_eq!(back, v, "value {v} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped_when_encoding() {
+        assert_eq!(encode_srgb(-1.0), 0);
+        assert_eq!(encode_srgb(2.0), 255);
+        assert_eq!(encode_srgb(f32::NAN), 0, "NaN must not wrap to a bright pixel");
+    }
+
+    #[test]
+    fn mse_is_zero_against_itself_and_positive_otherwise() {
+        let a = Canvas::filled(8, 8, [0.25, 0.5, 0.75]);
+        assert_eq!(a.mse(&a), 0.0);
+        let b = Canvas::filled(8, 8, [0.25, 0.5, 0.70]);
+        assert!(a.mse(&b) > 0.0);
+    }
+
+    #[test]
+    fn fit_within_preserves_aspect_and_never_upscales() {
+        assert_eq!(fit_within(1000, 500, 200), (200, 100));
+        assert_eq!(fit_within(500, 1000, 200), (100, 200));
+        assert_eq!(fit_within(64, 32, 200), (64, 32), "should not upscale");
+        assert_eq!(fit_within(0, 0, 200), (1, 1), "degenerate input must stay usable");
+        assert_eq!(fit_within(10_000, 1, 100), (100, 1), "extreme ratio must not round to zero");
+    }
+
+    #[test]
+    fn get_and_set_address_the_right_pixel() {
+        let mut c = Canvas::new(4, 3);
+        c.set(3, 2, [0.1, 0.2, 0.3]);
+        assert_eq!(c.get(3, 2), [0.1, 0.2, 0.3]);
+        assert_eq!(c.get(0, 0), [0.0, 0.0, 0.0]);
     }
 }
