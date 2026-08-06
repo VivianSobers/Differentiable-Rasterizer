@@ -69,6 +69,8 @@ pub struct GpuRasterizer {
     forward: wgpu::ComputePipeline,
     backward: wgpu::ComputePipeline,
     backward_recompute: wgpu::ComputePipeline,
+    forward_batch: wgpu::ComputePipeline,
+    backward_batch: wgpu::ComputePipeline,
     info: String,
 }
 
@@ -138,7 +140,27 @@ impl GpuRasterizer {
             &format!("{common}\n{}", include_str!("shaders/backward_recompute.wgsl")),
         );
 
-        Ok(Self { device, queue, forward, backward, backward_recompute, info })
+        let forward_batch = Self::pipeline(
+            &device,
+            "forward_batch",
+            &format!("{common}\n{}", include_str!("shaders/forward_batch.wgsl")),
+        );
+        let backward_batch = Self::pipeline(
+            &device,
+            "backward_batch",
+            &format!("{common}\n{}", include_str!("shaders/backward_batch.wgsl")),
+        );
+
+        Ok(Self {
+            device,
+            queue,
+            forward,
+            backward,
+            backward_recompute,
+            forward_batch,
+            backward_batch,
+            info,
+        })
     }
 
     fn pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ComputePipeline {
@@ -377,6 +399,194 @@ impl GpuRasterizer {
         Ok((rendered.mse(target), grads))
     }
 
+    /// Render a batch of scenes in a single dispatch.
+    ///
+    /// Every scene must have the same triangle count. Returns one canvas per
+    /// scene, in input order.
+    ///
+    /// Worth preferring over calling [`Self::render`] in a loop: measurement on
+    /// a 4090 shows small renders are dominated by per-dispatch overhead rather
+    /// than arithmetic, so amortizing that across a batch is where the time
+    /// actually goes.
+    pub fn render_many(&self, scenes: &[Scene], p: RenderParams) -> Result<Vec<Canvas>, GpuError> {
+        let Some(n_tris) = self.check_batch(scenes)? else {
+            return Ok(Vec::new());
+        };
+
+        let batch = scenes.len();
+        let pixels = p.width * p.height;
+        let (tri_buf, bg_buf) = self.pack_scenes(scenes);
+
+        let mut params = Self::gpu_params(&scenes[0], p, false);
+        params.n_tris = n_tris as u32;
+        let param_buf = self.uniform(&params);
+
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("images"),
+            size: (batch * pixels * 3 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("forward_batch"),
+            layout: &self.forward_batch.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: param_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: bg_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("forward_batch"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.forward_batch);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(
+                p.width.div_ceil(8) as u32,
+                p.height.div_ceil(8) as u32,
+                batch as u32,
+            );
+        }
+
+        let data = self.read_buffer(&mut encoder, &out_buf, (batch * pixels * 3 * 4) as u64)?;
+        Ok(data
+            .chunks_exact(pixels * 3)
+            .map(|chunk| Canvas { width: p.width, height: p.height, data: chunk.to_vec() })
+            .collect())
+    }
+
+    /// Render and differentiate a batch in a single pair of dispatches.
+    ///
+    /// Returns one `(loss, gradients)` per scene, matching the CPU
+    /// `diffrast::grad::backward_batch` exactly.
+    pub fn backward_many(
+        &self,
+        scenes: &[Scene],
+        p: RenderParams,
+        targets: &[Canvas],
+    ) -> Result<Vec<(f32, Vec<f32>)>, GpuError> {
+        if scenes.len() != targets.len() {
+            return Err(GpuError::TooLarge(format!(
+                "batch mismatch: {} scenes but {} targets",
+                scenes.len(),
+                targets.len()
+            )));
+        }
+        let Some(n_tris) = self.check_batch(scenes)? else {
+            return Ok(Vec::new());
+        };
+
+        let batch = scenes.len();
+
+        let rendered = self.render_many(scenes, p)?;
+
+        let (tri_buf, bg_buf) = self.pack_scenes(scenes);
+        let mut params = Self::gpu_params(&scenes[0], p, false);
+        params.n_tris = n_tris as u32;
+        let param_buf = self.uniform(&params);
+
+        let flat_rendered: Vec<f32> =
+            rendered.iter().flat_map(|c| c.data.iter().copied()).collect();
+        let flat_targets: Vec<f32> = targets.iter().flat_map(|c| c.data.iter().copied()).collect();
+
+        let rendered_buf = self.storage("rendered", &flat_rendered);
+        let target_buf = self.storage("targets", &flat_targets);
+        let grad_len = batch * n_tris * Triangle::N_PARAMS;
+        let grad_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("grads"),
+            contents: bytemuck::cast_slice(&vec![0.0f32; grad_len]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("backward_batch"),
+            layout: &self.backward_batch.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: param_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: rendered_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: target_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: bg_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("backward_batch"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.backward_batch);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(
+                p.width.div_ceil(8) as u32,
+                p.height.div_ceil(8) as u32,
+                batch as u32,
+            );
+        }
+
+        let grads = self.read_buffer(&mut encoder, &grad_buf, (grad_len * 4) as u64)?;
+        let stride = n_tris * Triangle::N_PARAMS;
+
+        Ok(rendered
+            .iter()
+            .zip(targets)
+            .zip(grads.chunks_exact(stride))
+            .map(|((r, t), g)| (r.mse(t), g.to_vec()))
+            .collect())
+    }
+
+    /// Validates a batch and returns its shared triangle count.
+    /// `Ok(None)` means the batch was empty.
+    fn check_batch(&self, scenes: &[Scene]) -> Result<Option<usize>, GpuError> {
+        let Some(first) = scenes.first() else { return Ok(None) };
+        let n_tris = first.len();
+        if n_tris == 0 {
+            return Err(GpuError::TooLarge("scenes must contain at least one triangle".into()));
+        }
+        // A ragged batch would silently read another scene's triangles rather
+        // than fail, so it is rejected up front.
+        if let Some(bad) = scenes.iter().position(|s| s.len() != n_tris) {
+            return Err(GpuError::TooLarge(format!(
+                "batched scenes must share a triangle count: item 0 has {n_tris}, item {bad} has {}",
+                scenes[bad].len()
+            )));
+        }
+        Ok(Some(n_tris))
+    }
+
+    /// Pack a batch's triangles and backgrounds into two buffers.
+    fn pack_scenes(&self, scenes: &[Scene]) -> (wgpu::Buffer, wgpu::Buffer) {
+        let tris: Vec<f32> = scenes.iter().flat_map(|s| s.params()).collect();
+        let backgrounds: Vec<f32> = scenes.iter().flat_map(|s| s.background).collect();
+        (self.storage("triangles", &tris), self.storage("backgrounds", &backgrounds))
+    }
+
+    fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    }
+
+    fn uniform(&self, params: &GpuParams) -> wgpu::Buffer {
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("params"),
+            contents: bytemuck::bytes_of(params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+    }
+
     /// Copy a storage buffer back to the host as `f32`s.
     fn read_buffer(
         &self,
@@ -557,6 +767,96 @@ mod tests {
 
         let norm = cpu_grads.iter().map(|g| g * g).sum::<f32>().sqrt().max(1e-12);
         assert!(max_abs_diff(&cpu_grads, &gpu_grads) / norm < 1e-3);
+    }
+
+    #[test]
+    fn batched_render_matches_single_renders() {
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(40, 32, 0.01);
+        // Deliberately different backgrounds: a batch that shared one would not
+        // catch per-item background indexing being wrong.
+        let scenes: Vec<Scene> = (0..5)
+            .map(|i| {
+                let mut s = test_scene(6);
+                s.background = [i as f32 * 0.15, 0.2, 0.5];
+                s
+            })
+            .collect();
+
+        let batched = gpu.render_many(&scenes, p).expect("batched");
+        assert_eq!(batched.len(), scenes.len());
+        for (i, scene) in scenes.iter().enumerate() {
+            let single = gpu.render(scene, p).expect("single");
+            assert_eq!(single.data, batched[i].data, "item {i} differs");
+        }
+    }
+
+    #[test]
+    fn batched_render_matches_cpu() {
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(32, 32, 0.008);
+        let scenes: Vec<Scene> = (0..3).map(|_| test_scene(10)).collect();
+
+        for (i, img) in gpu.render_many(&scenes, p).expect("batched").iter().enumerate() {
+            let diff = max_abs_diff(&cpu_render(&scenes[i], p).data, &img.data);
+            assert!(diff < 1e-5, "item {i}: max diff {diff}");
+        }
+    }
+
+    #[test]
+    fn batched_backward_matches_cpu() {
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(40, 40, 0.02);
+        let scenes: Vec<Scene> = (0..4).map(|_| test_scene(8)).collect();
+        let targets: Vec<Canvas> =
+            (0..4).map(|i| Canvas::filled(40, 40, [0.2 + i as f32 * 0.1, 0.4, 0.6])).collect();
+
+        let batched = gpu.backward_many(&scenes, p, &targets).expect("batched");
+        assert_eq!(batched.len(), 4);
+
+        for (i, (loss, grads)) in batched.iter().enumerate() {
+            let (rendered, tape) = render_with_tape(&scenes[i], p);
+            let (cpu_loss, cpu_grads) = cpu_backward(&scenes[i], p, &tape, &rendered, &targets[i]);
+
+            assert!((cpu_loss - loss).abs() < 1e-6, "item {i} loss {cpu_loss} vs {loss}");
+            let norm = cpu_grads.iter().map(|g| g * g).sum::<f32>().sqrt().max(1e-12);
+            let err = max_abs_diff(&cpu_grads, grads) / norm;
+            assert!(err < 1e-3, "item {i} gradient error {err}");
+        }
+    }
+
+    #[test]
+    fn batch_preserves_order() {
+        // Distinct targets per item, so a shuffled result would pair the wrong
+        // gradient with the wrong scene and show up as a loss mismatch.
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(24, 24, 0.02);
+        let scenes: Vec<Scene> = (0..6).map(|_| test_scene(5)).collect();
+        let targets: Vec<Canvas> = (0..6)
+            .map(|i| Canvas::filled(24, 24, [i as f32 / 6.0, 0.5, 1.0 - i as f32 / 6.0]))
+            .collect();
+
+        let batched = gpu.backward_many(&scenes, p, &targets).expect("batched");
+        for (i, (loss, _)) in batched.iter().enumerate() {
+            let expected = gpu.render(&scenes[i], p).expect("render").mse(&targets[i]);
+            assert!((loss - expected).abs() < 1e-6, "item {i} out of order");
+        }
+    }
+
+    #[test]
+    fn ragged_batches_are_rejected() {
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(16, 16, 0.02);
+        let scenes = vec![test_scene(4), test_scene(7)];
+        assert!(gpu.render_many(&scenes, p).is_err());
+    }
+
+    #[test]
+    fn empty_batch_is_empty_not_an_error() {
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(16, 16, 0.02);
+        assert!(gpu.render_many(&[], p).expect("empty").is_empty());
+        assert!(gpu.backward_many(&[], p, &[]).expect("empty").is_empty());
     }
 
     #[test]
