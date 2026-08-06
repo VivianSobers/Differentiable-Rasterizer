@@ -165,8 +165,11 @@ impl WasmFitter {
             return Err("dimensions must be non-zero".to_string());
         }
         // Scale sigma with resolution so an upscaled render keeps the same
-        // apparent edge softness rather than turning blurry.
-        let sigma = 0.0015 * self.width as f32 / width as f32;
+        // apparent edge softness rather than turning blurry. Measured on the
+        // longest side, so a non-square export stays consistent.
+        let fit_side = self.width.max(self.height) as f32;
+        let out_side = width.max(height) as f32;
+        let sigma = 0.0015 * fit_side / out_side;
         let canvas = render(self.fitter.scene(), RenderParams::new(width, height, sigma));
         Ok(rgba_from_canvas(&canvas))
     }
@@ -180,8 +183,8 @@ fn js_err(msg: String) -> JsValue {
 fn canvas_from_rgba(width: usize, height: usize, rgba: &[u8]) -> Canvas {
     let mut canvas = Canvas::new(width, height);
     for (i, px) in rgba.chunks_exact(4).enumerate() {
-        for ch in 0..3 {
-            canvas.data[i * 3 + ch] = srgb_to_linear(px[ch]);
+        for (ch, &v) in px.iter().take(3).enumerate() {
+            canvas.data[i * 3 + ch] = srgb_to_linear(v);
         }
     }
     canvas
