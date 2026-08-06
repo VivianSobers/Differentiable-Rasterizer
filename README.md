@@ -183,6 +183,25 @@ triangle count (1.07x at 64 triangles, 1.49x at 512), and it held on both an
 integrated AMD card and the 4090, which is about as much evidence as a design
 choice like this can ask for. Both are kept, with a test asserting they agree.
 
+### Batched dispatch
+
+`render_many` and `backward_many` submit a whole batch as one dispatch. This was
+built because the profile pointed at it: 4x the geometry costing 1.08x the time
+means small renders are paying a fixed per-call price — upload, dispatch,
+readback — rather than doing arithmetic. Batching pays that once instead of once
+per item.
+
+The scene index rides in the dispatch's `z` dimension and triangles are addressed
+as `batch * n_tris + i`, so every accessor in `common.wgsl` works unchanged.
+Scenes in a batch must share a triangle count, which training satisfies by
+construction and which is checked rather than assumed — a ragged batch would
+silently read a neighbouring scene's triangles instead of failing.
+
+Only the recompute strategy is offered batched. A batched tape would need
+`batch x triangles x pixels x 3` floats — 12 GB for a batch of 32 at 256px with
+512 triangles, which exceeds a 4090's memory for a workload that otherwise fits
+comfortably.
+
 ### A note on how this was measured
 
 An earlier revision of this file reported, from an integrated AMD Radeon 860M,
@@ -245,10 +264,6 @@ sigma a fit ends on.
 
 ## Roadmap
 
-- **Batched GPU dispatch.** The backward pass on a 4090 is dominated by
-  per-call upload and readback, not arithmetic — visible in 4x the geometry
-  costing 1.08x the time. Packing a whole training batch into one dispatch
-  attacks the part that actually costs something.
 - **Route the PyTorch layer through the GPU rasterizer.** The bindings currently
   call the CPU path, which is what makes end-to-end training CPU-bound.
 - **Tiled binning.** Per-tile triangle lists would stop the shader visiting
