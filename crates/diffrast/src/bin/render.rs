@@ -3,13 +3,39 @@
 //!
 //! Usage: `cargo run --release --bin render -- [out.png] [size] [sigma]`
 
+use std::error::Error;
+
 use diffrast::{render, Canvas, RenderParams, Scene, Triangle};
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let out = args.next().unwrap_or_else(|| "out/render.png".to_string());
-    let size: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(512);
-    let sigma: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.0015);
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("usage: render [out.png] [size] [sigma]");
+        return Ok(());
+    }
+
+    let out = args.first().cloned().unwrap_or_else(|| "out/render.png".to_string());
+    let size: usize = match args.get(1) {
+        Some(v) => v.parse().map_err(|_| format!("size must be an integer, got '{v}'"))?,
+        None => 512,
+    };
+    let sigma: f32 = match args.get(2) {
+        Some(v) => v.parse().map_err(|_| format!("sigma must be a number, got '{v}'"))?,
+        None => 0.0015,
+    };
+    if size == 0 {
+        return Err("size must be greater than zero".into());
+    }
+    if !(sigma.is_finite() && sigma > 0.0) {
+        return Err("sigma must be positive and finite".into());
+    }
 
     let scene = demo_scene();
     let params = RenderParams::new(size, size, sigma);
@@ -18,10 +44,10 @@ fn main() {
     let canvas = render(&scene, params);
     let elapsed = start.elapsed();
 
-    if let Some(dir) = std::path::Path::new(&out).parent() {
-        std::fs::create_dir_all(dir).expect("failed to create output directory");
+    if let Some(dir) = std::path::Path::new(&out).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    canvas.save_png(&out).expect("failed to write PNG");
+    canvas.save_png(&out).map_err(|e| format!("cannot write {out}: {e}"))?;
 
     println!(
         "rendered {} triangles at {size}x{size} (sigma={sigma}) in {:.2?} -> {out}",
@@ -33,6 +59,7 @@ fn main() {
     // a scene compared against itself should score exactly zero.
     let reference: Canvas = render(&scene, params);
     println!("mse against itself: {:.3e}", canvas.mse(&reference));
+    Ok(())
 }
 
 /// Overlapping translucent triangles — enough to show soft edges, alpha
