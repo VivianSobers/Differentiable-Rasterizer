@@ -32,12 +32,15 @@ WGPU_BACKEND=vulkan WGPU_ADAPTER_NAME=4090 cargo run --release --bin gpu_bench
 
 ## 1. Establish a baseline before changing anything
 
-Run this on **box A** and keep the output. It is the number every later change
-gets compared against, and it takes two minutes.
+One command on each box. It builds, tests, benchmarks, and records the hardware
+into a single file — read-only apart from this repo's `target/` directory.
 
 ```sh
-cargo run --release --bin gpu_bench | tee docs/bench-4090.txt
+./scripts/collect-gpu-report.sh          # writes docs/gpu-report.txt
 ```
+
+That file is the number every later change gets compared against, and it takes
+about two minutes.
 
 The forward speedup should be far above the 10.7x measured here — a 4090 has
 roughly two orders of magnitude more compute than the integrated GPU these
@@ -135,8 +138,8 @@ render comparisons while B keeps training.
 
 Three things, in order of usefulness:
 
-1. `docs/bench-4090.txt` — decides whether the GPU backward is worth optimizing
-   further or needs the tiled rewrite.
+1. `docs/gpu-report.txt` from `scripts/collect-gpu-report.sh` — decides whether
+   the GPU backward is worth optimizing further or needs the tiled rewrite.
 2. `runs/*/history.json` — shows whether the amortized model is actually
    learning or just memorizing the warm start.
 3. Peak GPU memory during training (`nvidia-smi` during a run) — tells us how
