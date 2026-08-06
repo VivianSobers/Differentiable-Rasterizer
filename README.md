@@ -47,6 +47,7 @@ crates/diffrast/        Rust core
   src/scene.rs          Triangle/Scene types, flat parameter view
   src/serial.rs         Scene JSON export
   benches/raster.rs     Benchmark suite
+crates/diffrast-gpu/    GPU rasterizer — WGSL compute shaders via wgpu
 crates/diffrast-py/     PyO3 bindings — the rasterizer as a torch op
 crates/diffrast-wasm/   WebAssembly bindings
 python/diffrast/        Torch layer, model, datasets, plots
@@ -114,6 +115,59 @@ independent images. That is exactly the shape training needs.
 
 The patch-based tape uses **15x less memory** than storing a canvas per
 triangle: 13 MB versus 197 MB for 256 triangles at 256px.
+
+## The GPU path
+
+`crates/diffrast-gpu` runs the same renderer and the same gradients as WGSL
+compute shaders. Correctness is defined as agreement with the CPU, and checked:
+forward matches to **1e-6**, gradients to **2e-6** relative.
+
+```sh
+cargo run --release --bin gpu_bench
+```
+
+The port hinges on one inversion. The CPU loops over triangles, and each one
+composites onto what the last left behind — a dependency that serializes the
+whole loop. The GPU gives each thread one *pixel* and has it walk the triangle
+list itself. The sequential chain still exists; it just runs inside a thread
+instead of across them.
+
+Measured on an integrated AMD Radeon 860M (not a fast GPU — a 4090 should be far
+better, and `docs/RUNBOOK.md` covers reproducing this):
+
+| Forward | CPU (16 cores) | GPU | Speedup |
+| --- | --- | --- | --- |
+| 256x256, 128 triangles | 3.30 ms | 0.68 ms | 4.9x |
+| 512x512, 256 triangles | 24.8 ms | 2.98 ms | 8.3x |
+| 512x512, 1024 triangles | 93.8 ms | 8.80 ms | **10.7x** |
+
+The speedup grows with load, which is what you want to see — it means the device
+is being fed rather than waiting.
+
+**The backward pass is a different story, and worth being honest about.** On this
+GPU it is still *slower* than 16 CPU cores (0.4-0.7x). Two reasons, both real:
+
+- The CPU only touches pixels inside each triangle's bounding box. The GPU
+  visits every (pixel, triangle) pair and rejects most of them. For scenes of
+  many small triangles that asymmetry is large, and the fix is a tiled binning
+  pass — the clearest remaining optimization.
+- Gradients accumulate per triangle while threads are per pixel, so thousands of
+  threads contend on the same ten floats through compare-exchange loops.
+
+Storing the canvas state per triangle (the obvious port of the CPU tape) reaches
+384 MB at 512 triangles and 256px, and moving it costs more than it saves. So
+there are two backward implementations:
+
+| Mode | Compute | Memory | 256px, 512 tris |
+| --- | --- | --- | --- |
+| `Taped` | O(T) | O(T x pixels) | 201 ms |
+| `Recompute` | O(T²) | none | **133 ms** |
+
+`Recompute` re-derives the canvas beneath each triangle instead of storing it,
+and wins despite doing quadratically more arithmetic — the bounding-box cull
+makes it far cheaper than its complexity suggests. It is the default. Both are
+kept, and a test asserts they agree, because which one wins is a property of the
+device rather than of the algorithm.
 
 ## Running it
 
@@ -244,7 +298,7 @@ exactly 0 could never come back.
 ## Tests
 
 ```sh
-cargo test --release          # 65 Rust tests
+cargo test --release          # 72 Rust tests
 python -m unittest discover -s python -p "test_*.py"   # 43 Python tests
 cargo clippy --all-targets    # clean
 cargo fmt --all -- --check
@@ -289,9 +343,12 @@ sigma a fit ends on.
 
 ## Roadmap
 
-- **GPU rasterizer** (wgpu compute shaders). The single biggest win: it would
-  remove the CPU bottleneck from end-to-end training and make large-batch
-  rendering GPU-resident.
+- **Tiled binning for the GPU backward pass.** The forward pass is already a
+  10.7x win; the backward pass needs per-tile triangle lists to stop visiting
+  every (pixel, triangle) pair, plus per-tile gradient reduction to cut atomic
+  contention.
+- **Route the PyTorch layer through the GPU rasterizer.** The bindings currently
+  call the CPU path, which is what makes end-to-end training CPU-bound.
 - **Gaussian primitives** alongside triangles, closer to how 3D Gaussian
   splatting parameterizes scenes.
 - **Perceptual loss** (LPIPS) in place of MSE, which over-rewards blur.
