@@ -1,0 +1,32 @@
+[package]
+name = "diffrast-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebAssembly bindings for the differentiable rasterizer"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+diffrast = { path = "../diffrast" }
+wasm-bindgen = "0.2"
+
+# `rand` pulls in `getrandom`, which has no default entropy source on
+# wasm32-unknown-unknown and fails to compile without being told to use the
+# browser's crypto API. The fit itself is seeded deterministically and never
+# asks for OS entropy, but the dependency still has to build.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dependencies.console_error_panic_hook]
+version = "0.1"
+optional = true
+
+[features]
+default = ["console_error_panic_hook"]
+
+[package.metadata.wasm-pack.profile.release]
+# `-Os` over `-O3`: the fit is fast enough in the browser at the sizes the
+# viewer uses, and download size is the thing a visitor actually waits on.
+wasm-opt = ["-Os"]
