@@ -8,9 +8,11 @@
 //! vertex.
 
 pub mod canvas;
+pub mod grad;
 pub mod raster;
 pub mod scene;
 
 pub use canvas::Canvas;
+pub use grad::{backward, finite_difference, render_with_tape, Tape};
 pub use raster::{render, RenderParams};
 pub use scene::{Scene, Triangle};
