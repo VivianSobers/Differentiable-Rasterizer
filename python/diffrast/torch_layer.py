@@ -1,0 +1,178 @@
+"""The rasterizer as a PyTorch operation.
+
+This is what makes the renderer trainable *through*. `rasterize` is a normal
+differentiable op: a network can emit triangle parameters, render them, compare
+against a photo, and backpropagate all the way to its own weights. The forward
+and backward passes are the same Rust code the CLI uses, called through PyO3.
+
+    params = model(image)                    # (B, T, 10)
+    render = rasterize(params, 128, 128)     # (B, 3, H, W)
+    loss = F.mse_loss(render, image)
+    loss.backward()                          # gradients reach `model`
+
+Layout note: Rust works in `(B, H, W, 3)` because that is the memory order the
+rasterizer writes; PyTorch wants `(B, 3, H, W)`. The conversion happens at this
+boundary and nowhere else, so the rest of the Python code is idiomatic torch.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor
+
+try:
+    import diffrast_rs
+except ImportError as exc:  # pragma: no cover - import-time guidance
+    raise ImportError(
+        "the compiled extension `diffrast_rs` is not installed — build it with:\n"
+        "    cd crates/diffrast-py && maturin develop --release"
+    ) from exc
+
+#: Parameters per triangle: 6 position + 3 color + 1 alpha.
+N_PARAMS: int = diffrast_rs.params_per_triangle()
+
+
+class _Rasterize(torch.autograd.Function):
+    """Bridges Rust's gradients into PyTorch's autograd graph."""
+
+    @staticmethod
+    def forward(ctx, params: Tensor, height: int, width: int, sigma: float, background):
+        # The extension is CPU/float32 only; moving here rather than raising
+        # keeps a GPU training loop working without special-casing at every
+        # call site. The tensors coming back are re-attached to the caller's
+        # device in `rasterize`.
+        params_np = params.detach().to("cpu", torch.float32).contiguous().numpy()
+        images = diffrast_rs.render_batch(params_np, height, width, sigma, background)
+
+        ctx.save_for_backward(params)
+        ctx.sigma = sigma
+        ctx.background = background
+        return torch.from_numpy(images)
+
+    @staticmethod
+    def backward(ctx, grad_images: Tensor):
+        (params,) = ctx.saved_tensors
+        params_np = params.detach().to("cpu", torch.float32).contiguous().numpy()
+        grad_np = grad_images.detach().to("cpu", torch.float32).contiguous().numpy()
+
+        grads = diffrast_rs.backward_batch(params_np, grad_np, ctx.sigma, ctx.background)
+        grad_params = torch.from_numpy(grads).to(params.device, params.dtype)
+        # One gradient per forward input; the other four are non-tensors.
+        return grad_params, None, None, None, None
+
+
+def rasterize(
+    params: Tensor,
+    height: int,
+    width: int,
+    sigma: float = 0.0015,
+    background: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    channels_first: bool = True,
+) -> Tensor:
+    """Render a batch of triangle scenes, differentiably.
+
+    Args:
+        params: `(B, T, 10)` — `[x0, y0, x1, y1, x2, y2, r, g, b, a]` per
+            triangle, in normalized image coordinates.
+        height, width: output resolution.
+        sigma: edge softness in normalized units. Anneal this downward during
+            training exactly as the standalone fitter does — starting sharp
+            leaves triangles with no gradient to follow.
+        background: color the canvas is cleared to.
+        channels_first: return `(B, 3, H, W)` for torch, rather than the
+            `(B, H, W, 3)` the renderer produces natively.
+
+    Returns:
+        The rendered batch, in linear light.
+    """
+    if params.dim() != 3 or params.shape[-1] != N_PARAMS:
+        raise ValueError(
+            f"expected params of shape (B, T, {N_PARAMS}), got {tuple(params.shape)}"
+        )
+    if height <= 0 or width <= 0:
+        raise ValueError("height and width must be positive")
+    if not (sigma > 0):
+        raise ValueError("sigma must be positive")
+
+    images = _Rasterize.apply(params, height, width, sigma, background)
+    images = images.to(params.device, params.dtype)
+    return images.permute(0, 3, 1, 2).contiguous() if channels_first else images
+
+
+def fused_loss(
+    params: Tensor,
+    targets: Tensor,
+    sigma: float = 0.0015,
+    background: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> tuple[Tensor, Tensor]:
+    """Per-item MSE and parameter gradients in one call, without autograd.
+
+    Use this when fitting parameters directly — it skips building a graph and
+    never materializes the rendered images in Python, which is a meaningful
+    saving when the batch is large. For training a *network*, use `rasterize`
+    instead: this returns gradients rather than routing them.
+
+    Returns:
+        `(losses, grads)` — `(B,)` and `(B, T, 10)`.
+    """
+    if targets.dim() != 4:
+        raise ValueError(f"expected targets of shape (B, H, W, 3), got {tuple(targets.shape)}")
+
+    params_np = params.detach().to("cpu", torch.float32).contiguous().numpy()
+    targets_np = targets.detach().to("cpu", torch.float32).contiguous().numpy()
+
+    losses, grads = diffrast_rs.fused_loss_backward(params_np, targets_np, sigma, background)
+    return (
+        torch.tensor(losses, device=params.device),
+        torch.from_numpy(grads).to(params.device, params.dtype),
+    )
+
+
+def random_params(
+    batch: int,
+    triangles: int,
+    *,
+    device: torch.device | str = "cpu",
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Plausible starting parameters: small triangles scattered over the canvas.
+
+    Sized deliberately small. Triangles initialized to span the whole image
+    overlap so heavily that early gradients mostly cancel, and the fit spends
+    its first hundred iterations untangling them.
+    """
+    centers = torch.rand(batch, triangles, 1, 2, device=device, generator=generator)
+    offsets = (
+        torch.rand(batch, triangles, 3, 2, device=device, generator=generator) - 0.5
+    ) * 0.3
+    verts = (centers + offsets).reshape(batch, triangles, 6)
+
+    colors = torch.rand(batch, triangles, 3, device=device, generator=generator)
+    alphas = (
+        torch.rand(batch, triangles, 1, device=device, generator=generator) * 0.4 + 0.3
+    )
+    return torch.cat([verts, colors, alphas], dim=-1)
+
+
+def clamp_params(params: Tensor) -> Tensor:
+    """Project parameters back into their valid ranges.
+
+    Alpha is held strictly inside `[0, 1]`: a clamped alpha receives no
+    gradient, so a triangle that reached exactly 0 could never come back.
+    """
+    verts = params[..., :6].clamp(-0.25, 1.25)
+    colors = params[..., 6:9].clamp(0.0, 1.0)
+    alpha = params[..., 9:10].clamp(1e-3, 0.999)
+    return torch.cat([verts, colors, alpha], dim=-1)
+
+
+def psnr(a: Tensor, b: Tensor, max_value: float = 1.0) -> Tensor:
+    """Peak signal-to-noise ratio in dB — the usual reconstruction metric.
+
+    Reported alongside MSE because MSE values like `2.4e-5` are hard to compare
+    across resolutions, while PSNR is directly interpretable.
+    """
+    mse = torch.mean((a - b) ** 2)
+    if mse == 0:
+        return torch.tensor(float("inf"), device=a.device)
+    return 10.0 * torch.log10(max_value**2 / mse)
