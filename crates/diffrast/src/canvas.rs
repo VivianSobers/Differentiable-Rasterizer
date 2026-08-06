@@ -44,16 +44,18 @@ impl Canvas {
     /// the fitting loop minimizes.
     pub fn mse(&self, other: &Canvas) -> f32 {
         assert_eq!(self.data.len(), other.data.len(), "canvas size mismatch");
-        let sum: f32 = self
+        // Accumulated in f64: an f32 sum over a megapixel of small residuals
+        // loses enough precision to swamp a finite-difference gradient check.
+        let sum: f64 = self
             .data
             .iter()
             .zip(&other.data)
             .map(|(a, b)| {
-                let d = a - b;
+                let d = (a - b) as f64;
                 d * d
             })
             .sum();
-        sum / self.data.len() as f32
+        (sum / self.data.len() as f64) as f32
     }
 
     pub fn save_png(&self, path: impl AsRef<Path>) -> Result<(), image::ImageError> {
