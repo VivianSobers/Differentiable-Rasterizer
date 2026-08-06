@@ -8,11 +8,15 @@
 //! vertex.
 
 pub mod canvas;
+pub mod fit;
 pub mod grad;
+pub mod optim;
 pub mod raster;
 pub mod scene;
 
 pub use canvas::Canvas;
+pub use fit::{fit, FitConfig, FitProgress, FitReport};
 pub use grad::{backward, finite_difference, render_with_tape, Tape};
+pub use optim::Adam;
 pub use raster::{render, RenderParams};
 pub use scene::{Scene, Triangle};
