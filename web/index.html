@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Differentiable Rasterizer — live fit</title>
+    <style>
+      :root {
+        --surface: #1a1a19;
+        --panel: #232322;
+        --line: #34343200;
+        --border: #343432;
+        --ink: #f2f2f0;
+        --ink-muted: #8a8a86;
+        --series: #3987e5;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        padding: 2rem 1.25rem 3rem;
+        background: var(--surface);
+        color: var(--ink);
+        font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+
+      main {
+        max-width: 1000px;
+        margin: 0 auto;
+      }
+
+      h1 {
+        font-size: 1.5rem;
+        margin: 0 0 0.35rem;
+        letter-spacing: -0.01em;
+      }
+
+      .lede {
+        color: var(--ink-muted);
+        margin: 0 0 1.75rem;
+        max-width: 62ch;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+        gap: 1.25rem;
+        align-items: start;
+      }
+
+      @media (max-width: 760px) {
+        .layout {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 1rem;
+      }
+
+      .panel h2 {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--ink-muted);
+        margin: 0 0 0.75rem;
+        font-weight: 600;
+      }
+
+      canvas#stage {
+        width: 100%;
+        height: auto;
+        aspect-ratio: 1;
+        display: block;
+        border-radius: 6px;
+        background: #000;
+        image-rendering: pixelated;
+      }
+
+      canvas#target {
+        width: 100%;
+        height: auto;
+        aspect-ratio: 1;
+        display: block;
+        border-radius: 6px;
+        image-rendering: pixelated;
+      }
+
+      canvas#chart {
+        width: 100%;
+        height: 120px;
+        display: block;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-top: 0.9rem;
+        align-items: center;
+      }
+
+      button,
+      label.file {
+        background: #2f2f2d;
+        color: var(--ink);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 0.45rem 0.9rem;
+        font: inherit;
+        font-size: 0.9rem;
+        cursor: pointer;
+      }
+
+      button:hover,
+      label.file:hover {
+        background: #3a3a37;
+      }
+
+      button#start {
+        background: var(--series);
+        border-color: var(--series);
+        color: #fff;
+        font-weight: 600;
+      }
+
+      button#start:hover {
+        filter: brightness(1.08);
+      }
+
+      input[type="file"] {
+        display: none;
+      }
+
+      .slider {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        margin-bottom: 0.7rem;
+        font-size: 0.85rem;
+        color: var(--ink-muted);
+      }
+
+      .slider input {
+        flex: 1;
+        accent-color: var(--series);
+      }
+
+      .slider output {
+        min-width: 3.5ch;
+        text-align: right;
+        color: var(--ink);
+        font-variant-numeric: tabular-nums;
+      }
+
+      dl.stats {
+        display: grid;
+        grid-template-columns: auto auto;
+        gap: 0.3rem 1rem;
+        margin: 0;
+        font-size: 0.85rem;
+      }
+
+      dl.stats dt {
+        color: var(--ink-muted);
+      }
+
+      dl.stats dd {
+        margin: 0;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+        font-family: ui-monospace, monospace;
+      }
+
+      #status {
+        color: var(--ink-muted);
+        font-size: 0.85rem;
+        margin-top: 0.9rem;
+        min-height: 1.4em;
+      }
+
+      footer {
+        margin-top: 2rem;
+        color: var(--ink-muted);
+        font-size: 0.85rem;
+      }
+
+      footer code {
+        background: var(--panel);
+        padding: 0.1rem 0.35rem;
+        border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Differentiable Rasterizer</h1>
+      <p class="lede">
+        Triangles fitted to an image by gradient descent. The rasterizer, the analytic
+        gradients, and the Adam optimizer all run in Rust compiled to WebAssembly — this
+        page only loads the image and draws the frames. Press Start and watch the loss fall.
+      </p>
+
+      <div class="layout">
+        <section class="panel">
+          <h2>Fit</h2>
+          <canvas id="stage" width="512" height="512"></canvas>
+          <div class="controls">
+            <button id="start" type="button">Start</button>
+            <button id="reset" type="button">Reset</button>
+            <label class="file" for="file">Use your own image</label>
+            <input id="file" type="file" accept="image/*" />
+            <button id="download" type="button">Export 1024px</button>
+          </div>
+          <p id="status">loading WebAssembly…</p>
+        </section>
+
+        <aside>
+          <section class="panel" style="margin-bottom: 1.25rem">
+            <h2>Target</h2>
+            <canvas id="target" width="160" height="160"></canvas>
+          </section>
+
+          <section class="panel" style="margin-bottom: 1.25rem">
+            <h2>Settings</h2>
+            <div class="slider">
+              <span>triangles</span>
+              <input id="triangles" type="range" min="8" max="400" step="8" value="128" />
+              <output id="triangles-out">128</output>
+            </div>
+            <div class="slider">
+              <span>iterations</span>
+              <input id="iters" type="range" min="100" max="3000" step="100" value="1000" />
+              <output id="iters-out">1000</output>
+            </div>
+          </section>
+
+          <section class="panel" style="margin-bottom: 1.25rem">
+            <h2>Progress</h2>
+            <dl class="stats">
+              <dt>iteration</dt>
+              <dd id="stat-iter">—</dd>
+              <dt>loss</dt>
+              <dd id="stat-loss">—</dd>
+              <dt>best</dt>
+              <dd id="stat-best">—</dd>
+              <dt>sigma</dt>
+              <dd id="stat-sigma">—</dd>
+            </dl>
+          </section>
+
+          <section class="panel">
+            <h2>Loss (log scale)</h2>
+            <canvas id="chart"></canvas>
+          </section>
+        </aside>
+      </div>
+
+      <footer>
+        Build with <code>npm run all</code>, then serve over HTTP —
+        <code>npm run serve</code> — since WebAssembly cannot be fetched from a
+        <code>file://</code> URL.
+      </footer>
+    </main>
+
+    <script type="module" src="./dist/main.js"></script>
+  </body>
+</html>
