@@ -40,7 +40,7 @@ fn main() {
     };
     println!("adapter: {}\n", gpu.adapter_info());
 
-    println!("{:<28} {:>10} {:>10} {:>9}  {}", "forward", "cpu", "gpu", "speedup", "max diff");
+    println!("{:<28} {:>10} {:>10} {:>9}  max diff", "forward", "cpu", "gpu", "speedup");
     for &(size, tris) in &[(128usize, 64usize), (256, 128), (512, 256), (512, 1024)] {
         let scene = scene_of(tris);
         let p = RenderParams::new(size, size, 0.0015);
@@ -68,8 +68,8 @@ fn main() {
     }
 
     println!(
-        "\n{:<28} {:>10} {:>10} {:>10} {:>9}  {}",
-        "forward + backward", "cpu", "gpu taped", "gpu recomp", "best", "grad rel err"
+        "\n{:<28} {:>10} {:>10} {:>10} {:>9}  grad rel err",
+        "forward + backward", "cpu", "gpu taped", "gpu recomp", "best"
     );
     for &(size, tris) in &[(128usize, 64usize), (256, 128), (256, 512)] {
         let scene = scene_of(tris);

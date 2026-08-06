@@ -202,7 +202,7 @@ impl GpuRasterizer {
 
         if keep_tape {
             let needed = Self::tape_bytes(n_tris, p.width, p.height);
-            let limit = self.device.limits().max_storage_buffer_binding_size as u64;
+            let limit = self.device.limits().max_storage_buffer_binding_size;
             if needed > limit {
                 return Err(GpuError::TooLarge(format!(
                     "tape needs {} MB but the device caps storage buffers at {} MB — \
