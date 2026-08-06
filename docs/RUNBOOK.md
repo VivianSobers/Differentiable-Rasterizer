@@ -1,9 +1,11 @@
 # Runbook: two RTX 4090 boxes
 
 Everything here is meant to be run on your machines — I have no access to them,
-so these are instructions rather than something already executed. Numbers quoted
-from this repo were measured on a 16-core CPU and an integrated AMD GPU; treat
-them as a floor, not a prediction for a 4090.
+so these are instructions rather than something already executed.
+
+Baseline established 2026-08-06 on an RTX 4090 + 26-core i9-13900: forward is up
+to **71x** faster than the CPU, forward+backward up to **4.7x**. Raw output is in
+`docs/gpu-report.txt`; the README discusses what it means.
 
 ## 0. One-time setup, both boxes
 
@@ -42,14 +44,9 @@ into a single file — read-only apart from this repo's `target/` directory.
 That file is the number every later change gets compared against, and it takes
 about two minutes.
 
-The forward speedup should be far above the 10.7x measured here — a 4090 has
-roughly two orders of magnitude more compute than the integrated GPU these
-numbers came from, and the forward pass is compute-bound.
-
-The backward figure is the interesting one. On the test machine the GPU backward
-is *slower* than 16 CPU cores, for reasons explained in the README. Whether that
-survives on a 4090 is a genuine open question and the benchmark answers it
-directly. **Please send me that table** — it decides what to optimize next.
+Compare against `docs/gpu-report.txt`. A regression in the forward speedup
+usually means the adapter selection picked the wrong device; check the `adapter:`
+line names the 4090.
 
 ## 2. Splitting work across the two boxes
 

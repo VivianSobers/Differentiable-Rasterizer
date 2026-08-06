@@ -132,168 +132,70 @@ whole loop. The GPU gives each thread one *pixel* and has it walk the triangle
 list itself. The sequential chain still exists; it just runs inside a thread
 instead of across them.
 
-Measured on an integrated AMD Radeon 860M (not a fast GPU — a 4090 should be far
-better, and `docs/RUNBOOK.md` covers reproducing this):
+Measured on an **RTX 4090** against a 26-core i9-13900. (Reproduce with
+`./scripts/collect-gpu-report.sh`; `docs/gpu-report.txt` holds the raw run.)
 
-| Forward | CPU (16 cores) | GPU | Speedup |
+| Forward | CPU (26 cores) | RTX 4090 | Speedup |
 | --- | --- | --- | --- |
-| 256x256, 128 triangles | 3.30 ms | 0.68 ms | 4.9x |
-| 512x512, 256 triangles | 24.8 ms | 2.98 ms | 8.3x |
-| 512x512, 1024 triangles | 93.8 ms | 8.80 ms | **10.7x** |
+| 128x128, 64 triangles | 0.52 ms | 0.10 ms | 5.2x |
+| 256x256, 128 triangles | 3.65 ms | 0.20 ms | 18.2x |
+| 512x512, 256 triangles | 25.8 ms | 0.70 ms | 36.8x |
+| 512x512, 1024 triangles | 96.7 ms | 1.36 ms | **71x** |
 
-The speedup grows with load, which is what you want to see — it means the device
-is being fed rather than waiting.
+| Forward + backward | CPU (26 cores) | RTX 4090 | Speedup |
+| --- | --- | --- | --- |
+| 128x128, 64 triangles | 2.81 ms | 2.18 ms | 1.3x |
+| 256x256, 128 triangles | 22.2 ms | 16.9 ms | 1.3x |
+| 256x256, 512 triangles | 85.8 ms | 18.3 ms | **4.7x** |
 
-**The backward pass is a different story, and worth being honest about.** On this
-GPU it is still *slower* than 16 CPU cores (0.4-0.7x). Two reasons, both real:
+The speedup keeps growing with load and has not saturated at 1024 triangles,
+which says the device is still being fed rather than waiting.
 
-- The CPU only touches pixels inside each triangle's bounding box. The GPU
-  visits every (pixel, triangle) pair and rejects most of them. For scenes of
-  many small triangles that asymmetry is large, and the fix is a tiled binning
-  pass — the clearest remaining optimization.
-- Gradients accumulate per triangle while threads are per pixel, so thousands of
-  threads contend on the same ten floats through compare-exchange loops.
+The most informative number is not a speedup at all. Going from 128 to 512
+triangles at fixed resolution — 4x the geometry — costs the CPU **3.9x** more
+time and the GPU **1.08x**:
+
+| 256x256 | 128 triangles | 512 triangles | Cost of 4x geometry |
+| --- | --- | --- | --- |
+| CPU | 22.2 ms | 85.8 ms | 3.87x |
+| GPU | 16.9 ms | 18.3 ms | **1.08x** |
+
+The GPU absorbs four times the geometry almost for free, because at these sizes
+the backward pass is bound by fixed overhead — buffer upload and readback — not
+by arithmetic. That is the thing to attack next, and it is a very different
+problem from the one the profile suggested on weaker hardware.
+
+### Two backward implementations
 
 Storing the canvas state per triangle (the obvious port of the CPU tape) reaches
 384 MB at 512 triangles and 256px, and moving it costs more than it saves. So
-there are two backward implementations:
+there are two implementations, and `Recompute` is the default:
 
-| Mode | Compute | Memory | 256px, 512 tris |
+| Mode | Compute | Memory | 4090, 256px, 512 tris |
 | --- | --- | --- | --- |
-| `Taped` | O(T) | O(T x pixels) | 201 ms |
-| `Recompute` | O(T²) | none | **133 ms** |
+| `Taped` | O(T) | O(T x pixels) | 27.3 ms |
+| `Recompute` | O(T²) | none | **18.3 ms** |
 
-`Recompute` re-derives the canvas beneath each triangle instead of storing it,
+`Recompute` re-derives the canvas beneath each triangle rather than storing it,
 and wins despite doing quadratically more arithmetic — the bounding-box cull
-makes it far cheaper than its complexity suggests. It is the default. Both are
-kept, and a test asserts they agree, because which one wins is a property of the
-device rather than of the algorithm.
+makes it far cheaper than its complexity suggests. Its margin *grows* with
+triangle count (1.07x at 64 triangles, 1.49x at 512), and it held on both an
+integrated AMD card and the 4090, which is about as much evidence as a design
+choice like this can ask for. Both are kept, with a test asserting they agree.
 
-## Running it
+### A note on how this was measured
 
-**Command line.** Fit an image and write every artifact:
+An earlier revision of this file reported, from an integrated AMD Radeon 860M,
+that the GPU backward pass was *slower* than the CPU and needed a tiled-binning
+rewrite. On the 4090 it is 1.3-4.7x faster and binning is no longer the
+bottleneck. The integrated result was real, but it generalized badly: a GPU
+sharing system memory with the CPU is close to the worst case for this workload.
+The conclusion changed because the measurement changed, which is the argument
+for keeping `gpu_bench` in the repo rather than quoting numbers from one machine.
 
-```sh
-cargo run --release --bin fit -- photo.jpg --tris 200 --iters 2000 --save-every 10
-```
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--tris` | 128 | triangles in the scene |
-| `--iters` | 1500 | optimizer steps |
-| `--size` | 192 | longest side of the fit |
-| `--out` | `out` | output directory |
-| `--save-every` | 0 (off) | write a frame every N iterations |
-| `--export` | 1024 | longest side of the final render |
-| `--seed` | 0 | RNG seed |
-| `--patience` | 250 | stop after N stalled iterations (0 disables) |
-
-Omit the image to fit a generated synthetic target. Outputs are `fit.png`,
-`target.png`, `scene.json`, and `loss.csv`.
-
-**Python** — the same fit plus charts and an animated GIF:
-
-```sh
-pip install -r python/requirements.txt
-python python/report.py photo.jpg --tris 200 --iters 2000
-python python/sweep.py --counts 32 128 512      # compare triangle budgets
-```
-
-**Browser** — a live fit you can point at your own image:
-
-```sh
-cd web && npm install && npm run all && npm run serve
-# open http://localhost:8080
-```
-
-## How it works
-
-### The forward pass
-
-Coverage is `sigmoid(sd / sigma)`, where `sd` is the signed distance to the
-triangle boundary — positive inside. Distance is measured to the nearest edge
-*segment*, not to the nearest edge's infinite half-plane. Half-planes are
-cheaper but badly overestimate distance near corners, which would give wrong
-gradient magnitudes exactly where triangles meet.
-
-Triangles composite back-to-front with alpha-over. Rendering happens in linear
-light; gamma is applied only when writing a PNG.
-
-### The backward pass
-
-`render_with_tape` records what the reverse sweep needs; `backward` returns the
-loss and one gradient per parameter — 6 position, 3 color, 1 alpha per triangle.
-
-```rust
-let (rendered, tape) = render_with_tape(&scene, params);
-let (loss, grads) = backward(&scene, params, &tape, &rendered, &target);
-```
-
-Compositing is sequential, so the reverse sweep needs the canvas as it stood
-*before* each triangle was painted. Storing a full canvas per triangle costs
-`K × W × H × 3` floats — 630MB for 200 triangles at 512px. "Un-compositing" by
-dividing by `1 - w` avoids that but blows up as `w` approaches 1. So the tape
-saves only the rectangle each triangle actually touched, and memory scales with
-coverage instead.
-
-The one derivation worth reading the comments for is the distance term. For the
-nearest edge `(a, b)`, closest point `a + t(b - a)`, and unit vector `u` from
-that point toward the pixel:
-
-```
-d(dist)/da = -(1 - t) * u        d(dist)/db = -t * u
-```
-
-That holds whether the projection lands inside the segment or is clamped to an
-endpoint — in the interior case `t` sits at a minimum of the distance, so the
-term through `dt` vanishes. Carrying a spurious `dt` term is the standard way
-this gradient ends up subtly wrong near corners, and it fails quietly: nothing
-crashes, fits just converge worse than they should.
-
-`finite_difference` computes the same gradient numerically. It is far too slow
-to train with; it exists so the analytic path can be checked against it, which
-`cargo test` does over all 10 parameters of a two-triangle scene.
-
-### Making it converge
-
-Three things matter more than the rest.
-
-**Sigma annealing.** The fit starts blurry (`sigma_start = 0.02`, roughly 4px)
-and sharpens geometrically to `sigma_end`. Starting sharp is the most common way
-a fit stalls — with a tight sigma, a triangle that doesn't already overlap the
-region it should cover sees no gradient at all and never moves. The schedule is
-geometric rather than linear because sigma is a scale: halving it means the same
-thing at 0.02 as at 0.002, so equal ratios deserve equal time.
-
-**Per-parameter learning rates.** Positions live in normalized units where the
-whole canvas is 1.0 wide, so they need a much smaller rate than colors. A single
-global rate either freezes geometry or flings vertices off-screen.
-
-**Color initialization from the target.** Each triangle is seeded with the
-target's color at its centroid, so the fit starts near the right palette and
-spends its steps on geometry instead of rediscovering that the sky is blue.
-
-Alpha is projected into `[1e-3, 0.999]` rather than `[0, 1]`, because the
-backward pass gives a clamped alpha no gradient — a triangle that reached
-exactly 0 could never come back.
-
-## Robustness
-
-- **Invalid configs are rejected up front** with a specific error. A zero sigma
-  divides by zero deep inside the coverage function and a negative learning rate
-  quietly *maximizes* the loss; both are far harder to diagnose after the fact.
-- **The best scene is returned, not the last.** Annealing means late iterations
-  can be marginally worse than the middle of the run.
-- **Divergence is caught.** A non-finite loss stops the fit before NaN can enter
-  Adam's moments, where it would never leave.
-- **Non-finite parameters are sanitized** each step. NaN survives `clamp` — it
-  propagates through both comparisons — so it is replaced outright.
-- **Early stopping** on a configurable patience, so a converged fit doesn't burn
-  its remaining budget.
-- **Non-square and 1-pixel targets** are handled without cropping.
-- **Both CLIs report errors and exit non-zero** rather than panicking.
-- **The serializer can't emit invalid JSON** — `NaN` and `inf` are not JSON, and
-  a serializer that can produce unparseable output is a trap.
+Cross-vendor agreement is itself a correctness signal: RADV (AMD) and NVIDIA's
+driver both match the CPU forward pass to ~1e-6 and gradients to ~1e-4 relative,
+having compiled the same WGSL through entirely different toolchains.
 
 ## Tests
 
@@ -343,12 +245,15 @@ sigma a fit ends on.
 
 ## Roadmap
 
-- **Tiled binning for the GPU backward pass.** The forward pass is already a
-  10.7x win; the backward pass needs per-tile triangle lists to stop visiting
-  every (pixel, triangle) pair, plus per-tile gradient reduction to cut atomic
-  contention.
+- **Batched GPU dispatch.** The backward pass on a 4090 is dominated by
+  per-call upload and readback, not arithmetic — visible in 4x the geometry
+  costing 1.08x the time. Packing a whole training batch into one dispatch
+  attacks the part that actually costs something.
 - **Route the PyTorch layer through the GPU rasterizer.** The bindings currently
   call the CPU path, which is what makes end-to-end training CPU-bound.
+- **Tiled binning.** Per-tile triangle lists would stop the shader visiting
+  every (pixel, triangle) pair. Lower priority than it looked from the
+  integrated-GPU profile — the 4090 rejects culled pairs almost for free.
 - **Gaussian primitives** alongside triangles, closer to how 3D Gaussian
   splatting parameterizes scenes.
 - **Perceptual loss** (LPIPS) in place of MSE, which over-rewards blur.

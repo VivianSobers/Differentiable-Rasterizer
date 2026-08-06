@@ -56,7 +56,11 @@ section "Tests"
 cargo test --release 2>&1 | grep -E "test result|^error|FAILED" | tee -a "$OUT"
 
 section "CPU benchmarks"
-cargo bench 2>&1 | grep -vE "^(   Compiling|    Finished|     Running)" | tee -a "$OUT"
+# --bench raster, not a bare `cargo bench`: the latter also runs every test
+# target in bench mode and buries the numbers under a wall of "ignored" lines.
+cargo bench --bench raster 2>&1 \
+    | grep -vE "^(   Compiling|    Finished|     Running|running |test result|^test )" \
+    | tee -a "$OUT"
 
 section "GPU benchmarks"
 cargo run --release --bin gpu_bench 2>&1 \
