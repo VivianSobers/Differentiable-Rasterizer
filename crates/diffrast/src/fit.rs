@@ -261,11 +261,7 @@ fn mean_color(c: &Canvas) -> [f32; 3] {
             sum[ch] += px[ch] as f64;
         }
     }
-    [
-        (sum[0] / n as f64) as f32,
-        (sum[1] / n as f64) as f32,
-        (sum[2] / n as f64) as f32,
-    ]
+    [(sum[0] / n as f64) as f32, (sum[1] / n as f64) as f32, (sum[2] / n as f64) as f32]
 }
 
 /// Nearest-pixel sample at normalized coordinates, clamped to the canvas.
@@ -322,7 +318,11 @@ mod tests {
     fn target_scene() -> Scene {
         let mut s = Scene::new([0.08, 0.09, 0.12]);
         s.push(Triangle::new([[0.20, 0.25], [0.80, 0.30], [0.50, 0.80]], [0.90, 0.30, 0.20], 0.9))
-            .push(Triangle::new([[0.30, 0.55], [0.85, 0.60], [0.60, 0.15]], [0.20, 0.60, 0.90], 0.7));
+            .push(Triangle::new(
+                [[0.30, 0.55], [0.85, 0.60], [0.60, 0.15]],
+                [0.20, 0.60, 0.90],
+                0.7,
+            ));
         s
     }
 
@@ -362,7 +362,11 @@ mod tests {
         let report = fit(&target_at(48), &cfg, |_| {}).unwrap();
 
         let first = report.initial_loss();
-        assert!(report.best_loss < first * 0.5, "loss barely moved: {first} -> {}", report.best_loss);
+        assert!(
+            report.best_loss < first * 0.5,
+            "loss barely moved: {first} -> {}",
+            report.best_loss
+        );
         assert!(report.best_loss.is_finite(), "loss diverged");
         assert!(report.improvement() > 2.0);
     }
@@ -414,8 +418,7 @@ mod tests {
     fn patience_stops_a_stalled_fit_early() {
         // An already-perfect fit cannot improve, so patience should fire well
         // before the iteration budget runs out.
-        let cfg =
-            FitConfig { triangles: 4, iters: 1000, patience: Some(5), ..Default::default() };
+        let cfg = FitConfig { triangles: 4, iters: 1000, patience: Some(5), ..Default::default() };
         let target = Canvas::filled(24, 24, [0.4, 0.4, 0.4]);
 
         let report = fit(&target, &cfg, |_| {}).unwrap();

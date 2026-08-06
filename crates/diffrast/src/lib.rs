@@ -17,8 +17,8 @@ pub mod serial;
 
 pub use canvas::{fit_within, Canvas};
 pub use fit::{fit, ConfigError, FitConfig, FitProgress, FitReport, StopReason};
-pub use serial::scene_to_json;
 pub use grad::{backward, finite_difference, render_with_tape, Tape};
 pub use optim::Adam;
 pub use raster::{render, RenderParams};
 pub use scene::{Scene, Triangle};
+pub use serial::scene_to_json;

@@ -5,7 +5,7 @@
 //! round trip through disk, and that resolution independence really holds.
 
 use diffrast::{
-    fit, fit_within, render, render_with_tape, scene_to_json, backward, Canvas, FitConfig,
+    backward, fit, fit_within, render, render_with_tape, scene_to_json, Canvas, FitConfig,
     RenderParams, Scene, StopReason, Triangle,
 };
 

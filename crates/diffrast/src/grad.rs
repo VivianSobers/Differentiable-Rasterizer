@@ -43,11 +43,7 @@ impl Tape {
     /// Bytes held by the recorded patches — worth watching when scaling up
     /// triangle count or resolution.
     pub fn memory_bytes(&self) -> usize {
-        self.patches
-            .iter()
-            .flatten()
-            .map(|p| p.before.len() * std::mem::size_of::<f32>())
-            .sum()
+        self.patches.iter().flatten().map(|p| p.before.len() * std::mem::size_of::<f32>()).sum()
     }
 }
 
@@ -112,12 +108,8 @@ pub fn backward(
 
     // d(mse)/d(output pixel).
     let scale = 2.0 / rendered.data.len() as f32;
-    let mut d_canvas: Vec<f32> = rendered
-        .data
-        .iter()
-        .zip(&target.data)
-        .map(|(r, t)| scale * (r - t))
-        .collect();
+    let mut d_canvas: Vec<f32> =
+        rendered.data.iter().zip(&target.data).map(|(r, t)| scale * (r - t)).collect();
 
     // Front-to-back: the reverse of the compositing order.
     for (k, tri) in scene.tris.iter().enumerate().rev() {
@@ -232,11 +224,8 @@ fn closest_point_on_segment(a: [f32; 2], b: [f32; 2], pt: [f32; 2]) -> (f32, f32
     let ab = [b[0] - a[0], b[1] - a[1]];
     let ap = [pt[0] - a[0], pt[1] - a[1]];
     let len2 = ab[0] * ab[0] + ab[1] * ab[1];
-    let t = if len2 <= 1e-20 {
-        0.0
-    } else {
-        ((ap[0] * ab[0] + ap[1] * ab[1]) / len2).clamp(0.0, 1.0)
-    };
+    let t =
+        if len2 <= 1e-20 { 0.0 } else { ((ap[0] * ab[0] + ap[1] * ab[1]) / len2).clamp(0.0, 1.0) };
     let dx = ap[0] - t * ab[0];
     let dy = ap[1] - t * ab[1];
     (t, (dx * dx + dy * dy).sqrt())

@@ -126,7 +126,8 @@ fn point_segment_distance(a: [f32; 2], b: [f32; 2], pt: [f32; 2]) -> f32 {
     let ap = [pt[0] - a[0], pt[1] - a[1]];
     let len2 = ab[0] * ab[0] + ab[1] * ab[1];
     // Degenerate edge (coincident vertices): fall back to point distance.
-    let t = if len2 <= 1e-20 { 0.0 } else { ((ap[0] * ab[0] + ap[1] * ab[1]) / len2).clamp(0.0, 1.0) };
+    let t =
+        if len2 <= 1e-20 { 0.0 } else { ((ap[0] * ab[0] + ap[1] * ab[1]) / len2).clamp(0.0, 1.0) };
     let dx = ap[0] - t * ab[0];
     let dy = ap[1] - t * ab[1];
     (dx * dx + dy * dy).sqrt()
@@ -140,7 +141,10 @@ pub fn pixel_center(x: usize, y: usize, p: RenderParams) -> [f32; 2] {
 
 /// Pixel-space bounding box for a triangle, padded by the softness radius.
 /// Returns `None` when the triangle is entirely off-canvas.
-pub(crate) fn pixel_bounds(tri: &Triangle, p: RenderParams) -> Option<(usize, usize, usize, usize)> {
+pub(crate) fn pixel_bounds(
+    tri: &Triangle,
+    p: RenderParams,
+) -> Option<(usize, usize, usize, usize)> {
     let pad = p.cull_radius();
     let (mut lo_x, mut lo_y) = (f32::INFINITY, f32::INFINITY);
     let (mut hi_x, mut hi_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);

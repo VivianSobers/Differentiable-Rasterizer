@@ -22,7 +22,14 @@ pub struct Adam {
 
 impl Adam {
     pub fn new(n_params: usize) -> Self {
-        Self { m: vec![0.0; n_params], v: vec![0.0; n_params], t: 0, beta1: 0.9, beta2: 0.999, eps: 1e-8 }
+        Self {
+            m: vec![0.0; n_params],
+            v: vec![0.0; n_params],
+            t: 0,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+        }
     }
 
     pub fn steps_taken(&self) -> u32 {
