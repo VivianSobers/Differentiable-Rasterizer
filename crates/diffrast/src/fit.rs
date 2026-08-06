@@ -10,13 +10,45 @@ use crate::optim::Adam;
 use crate::raster::RenderParams;
 use crate::scene::{Scene, Triangle};
 
+/// Why a fit stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    /// Ran the full iteration budget.
+    Completed,
+    /// The loss stopped improving for `patience` iterations.
+    Converged,
+    /// The loss became NaN or infinite. The returned scene is the last one
+    /// known to be finite.
+    Diverged,
+}
+
+/// A configuration that could not produce a sensible fit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    NoTriangles,
+    NonPositiveSigma,
+    SigmaNotDecreasing,
+    NonPositiveLearningRate,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            Self::NoTriangles => "triangles must be greater than zero",
+            Self::NonPositiveSigma => "sigma_start and sigma_end must be positive and finite",
+            Self::SigmaNotDecreasing => "sigma_start must be greater than or equal to sigma_end",
+            Self::NonPositiveLearningRate => "learning rates must be positive and finite",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 #[derive(Clone, Debug)]
 pub struct FitConfig {
     pub triangles: usize,
     pub iters: usize,
-    /// Resolution the fit runs at. Geometry is resolution-independent, so a
-    /// scene fitted small can be re-rendered large afterwards.
-    pub size: usize,
     /// Softness at the start of the fit — deliberately blurry.
     pub sigma_start: f32,
     /// Softness at the end — near pixel-sharp.
@@ -25,6 +57,11 @@ pub struct FitConfig {
     pub lr_color: f32,
     pub lr_alpha: f32,
     pub seed: u64,
+    /// Stop early if the loss has not improved by at least `min_delta` over
+    /// this many iterations. `None` disables the check.
+    pub patience: Option<usize>,
+    /// Improvement below this counts as no improvement.
+    pub min_delta: f32,
 }
 
 impl Default for FitConfig {
@@ -32,7 +69,6 @@ impl Default for FitConfig {
         Self {
             triangles: 128,
             iters: 1500,
-            size: 192,
             // Roughly 4 pixels of blur at 192px, annealed down to well under
             // one. Starting sharp is the most common way a fit stalls: with a
             // tight sigma, a triangle that does not already overlap the region
@@ -46,7 +82,38 @@ impl Default for FitConfig {
             lr_color: 0.02,
             lr_alpha: 0.01,
             seed: 0,
+            patience: Some(250),
+            min_delta: 1e-7,
         }
+    }
+}
+
+impl FitConfig {
+    /// Reject configurations that cannot produce a sensible fit.
+    ///
+    /// Checked up front rather than left to surface as a silent non-result:
+    /// a zero sigma divides by zero deep inside the coverage function, and a
+    /// negative learning rate quietly maximizes the loss instead of minimizing
+    /// it — both are far harder to diagnose after the fact than at the door.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.triangles == 0 {
+            return Err(ConfigError::NoTriangles);
+        }
+        if !(self.sigma_start.is_finite() && self.sigma_end.is_finite())
+            || self.sigma_start <= 0.0
+            || self.sigma_end <= 0.0
+        {
+            return Err(ConfigError::NonPositiveSigma);
+        }
+        if self.sigma_start < self.sigma_end {
+            return Err(ConfigError::SigmaNotDecreasing);
+        }
+        for lr in [self.lr_pos, self.lr_color, self.lr_alpha] {
+            if !lr.is_finite() || lr <= 0.0 {
+                return Err(ConfigError::NonPositiveLearningRate);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -58,23 +125,51 @@ pub struct FitProgress<'a> {
     pub scene: &'a Scene,
 }
 
+#[derive(Clone, Debug)]
 pub struct FitReport {
+    /// The best scene seen, not necessarily the last one. Sigma annealing means
+    /// late iterations can be slightly worse than the middle of the run, so
+    /// returning the final scene would sometimes throw away the better result.
     pub scene: Scene,
     /// Loss at every iteration, in order.
     pub losses: Vec<f32>,
+    pub stop_reason: StopReason,
+    /// Iteration at which `scene` was captured.
+    pub best_iter: usize,
+    pub best_loss: f32,
 }
 
 impl FitReport {
     pub fn final_loss(&self) -> f32 {
         self.losses.last().copied().unwrap_or(f32::NAN)
     }
+
+    pub fn initial_loss(&self) -> f32 {
+        self.losses.first().copied().unwrap_or(f32::NAN)
+    }
+
+    /// How many times smaller the best loss is than the first. `1.0` means no
+    /// progress; `NaN` if the fit never ran.
+    pub fn improvement(&self) -> f32 {
+        self.initial_loss() / self.best_loss
+    }
 }
 
 /// Fit a scene of soft triangles to `target`.
 ///
-/// `on_progress` is called once per iteration — use it to save frames, print,
-/// or log. Pass `|_| {}` to run silently.
-pub fn fit(target: &Canvas, cfg: &FitConfig, mut on_progress: impl FnMut(FitProgress)) -> FitReport {
+/// The fit runs at the target's own resolution, so non-square images work
+/// without cropping. `on_progress` is called once per iteration — use it to
+/// save frames, print, or log. Pass `|_| {}` to run silently.
+///
+/// Returns `Err` only for an invalid configuration; anything that goes wrong
+/// during the run itself is reported through [`FitReport::stop_reason`].
+pub fn fit(
+    target: &Canvas,
+    cfg: &FitConfig,
+    mut on_progress: impl FnMut(FitProgress),
+) -> Result<FitReport, ConfigError> {
+    cfg.validate()?;
+
     let mut rng = StdRng::seed_from_u64(cfg.seed);
     let mut scene = seed_scene(target, cfg, &mut rng);
 
@@ -83,22 +178,47 @@ pub fn fit(target: &Canvas, cfg: &FitConfig, mut on_progress: impl FnMut(FitProg
     let mut adam = Adam::new(params.len());
     let mut losses = Vec::with_capacity(cfg.iters);
 
+    let mut best = (0usize, f32::INFINITY, scene.clone());
+    let mut since_improved = 0usize;
+    let mut stop_reason = StopReason::Completed;
+
     for i in 0..cfg.iters {
         let sigma = sigma_at(cfg, i);
-        let rp = RenderParams::new(cfg.size, cfg.size, sigma);
+        let rp = RenderParams::new(target.width, target.height, sigma);
 
         let (rendered, tape) = render_with_tape(&scene, rp);
         let (loss, grads) = backward(&scene, rp, &tape, &rendered, target);
 
+        // Bail before a non-finite loss can poison the optimizer state: once a
+        // NaN enters Adam's moments it never leaves, and every subsequent
+        // parameter silently becomes NaN too.
+        if !loss.is_finite() {
+            stop_reason = StopReason::Diverged;
+            break;
+        }
+
+        losses.push(loss);
+        if loss + cfg.min_delta < best.1 {
+            best = (i, loss, scene.clone());
+            since_improved = 0;
+        } else {
+            since_improved += 1;
+        }
+
+        on_progress(FitProgress { iter: i, loss, sigma, scene: &scene });
+
+        if cfg.patience.is_some_and(|p| since_improved >= p) {
+            stop_reason = StopReason::Converged;
+            break;
+        }
+
         adam.step(&mut params, &grads, &lr);
         project(&mut params);
         scene.set_params(&params);
-
-        losses.push(loss);
-        on_progress(FitProgress { iter: i, loss, sigma, scene: &scene });
     }
 
-    FitReport { scene, losses }
+    let (best_iter, best_loss, best_scene) = best;
+    Ok(FitReport { scene: best_scene, losses, stop_reason, best_iter, best_loss })
 }
 
 /// Softness for iteration `i`, annealed geometrically from `sigma_start` to
@@ -169,6 +289,15 @@ fn learning_rates(cfg: &FitConfig, n_tris: usize) -> Vec<f32> {
 /// Clamp parameters back into their valid ranges after each step.
 fn project(params: &mut [f32]) {
     for tri in params.chunks_exact_mut(Triangle::N_PARAMS) {
+        // A single non-finite parameter would spread through the render into
+        // every gradient. Clamping handles infinities; NaN survives `clamp`
+        // (it propagates through both comparisons), so it needs replacing
+        // outright before the clamps below can do their job.
+        for v in tri.iter_mut() {
+            if v.is_nan() {
+                *v = 0.5;
+            }
+        }
         // Positions may wander a little off-canvas — a triangle clipped by the
         // frame edge is legitimate — but not arbitrarily far, or culled
         // triangles drift away with no gradient to pull them back.
@@ -223,37 +352,114 @@ mod tests {
         assert_eq!(p[9], 0.999);
     }
 
+    fn target_at(size: usize) -> Canvas {
+        render(&target_scene(), RenderParams::new(size, size, 0.002))
+    }
+
     #[test]
     fn loss_decreases_on_a_synthetic_target() {
-        let cfg = FitConfig { triangles: 16, iters: 200, size: 48, seed: 7, ..Default::default() };
-        let target = render(&target_scene(), RenderParams::new(cfg.size, cfg.size, 0.002));
+        let cfg = FitConfig { triangles: 16, iters: 200, seed: 7, ..Default::default() };
+        let report = fit(&target_at(48), &cfg, |_| {}).unwrap();
 
-        let report = fit(&target, &cfg, |_| {});
-
-        let first = report.losses[0];
-        let last = report.final_loss();
-        assert!(last < first * 0.5, "loss barely moved: {first} -> {last}");
-        assert!(last.is_finite(), "loss diverged to {last}");
+        let first = report.initial_loss();
+        assert!(report.best_loss < first * 0.5, "loss barely moved: {first} -> {}", report.best_loss);
+        assert!(report.best_loss.is_finite(), "loss diverged");
+        assert!(report.improvement() > 2.0);
     }
 
     #[test]
     fn fitting_is_deterministic_for_a_fixed_seed() {
-        let cfg = FitConfig { triangles: 8, iters: 30, size: 32, seed: 42, ..Default::default() };
-        let target = render(&target_scene(), RenderParams::new(cfg.size, cfg.size, 0.002));
+        let cfg = FitConfig { triangles: 8, iters: 30, seed: 42, ..Default::default() };
+        let target = target_at(32);
 
-        let a = fit(&target, &cfg, |_| {});
-        let b = fit(&target, &cfg, |_| {});
+        let a = fit(&target, &cfg, |_| {}).unwrap();
+        let b = fit(&target, &cfg, |_| {}).unwrap();
         assert_eq!(a.losses, b.losses);
         assert_eq!(a.scene.params(), b.scene.params());
     }
 
     #[test]
     fn progress_callback_reports_every_iteration() {
-        let cfg = FitConfig { triangles: 4, iters: 10, size: 32, ..Default::default() };
-        let target = Canvas::filled(cfg.size, cfg.size, [0.5, 0.2, 0.7]);
+        let cfg = FitConfig { triangles: 4, iters: 10, patience: None, ..Default::default() };
+        let target = Canvas::filled(32, 32, [0.5, 0.2, 0.7]);
 
         let mut seen = Vec::new();
-        fit(&target, &cfg, |p| seen.push(p.iter));
+        fit(&target, &cfg, |p| seen.push(p.iter)).unwrap();
         assert_eq!(seen, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn non_square_targets_are_fitted_without_cropping() {
+        let cfg = FitConfig { triangles: 8, iters: 20, ..Default::default() };
+        let target = Canvas::filled(64, 24, [0.3, 0.6, 0.2]);
+
+        let report = fit(&target, &cfg, |_| {}).unwrap();
+        let out = render(&report.scene, RenderParams::new(64, 24, 0.002));
+        assert_eq!(out.width, 64);
+        assert_eq!(out.height, 24);
+        assert!(report.best_loss.is_finite());
+    }
+
+    #[test]
+    fn best_scene_is_returned_not_the_last() {
+        let cfg = FitConfig { triangles: 12, iters: 150, seed: 3, ..Default::default() };
+        let target = target_at(40);
+
+        let report = fit(&target, &cfg, |_| {}).unwrap();
+        assert!(report.best_loss <= report.final_loss());
+        assert_eq!(report.best_loss, report.losses[report.best_iter]);
+    }
+
+    #[test]
+    fn patience_stops_a_stalled_fit_early() {
+        // An already-perfect fit cannot improve, so patience should fire well
+        // before the iteration budget runs out.
+        let cfg =
+            FitConfig { triangles: 4, iters: 1000, patience: Some(5), ..Default::default() };
+        let target = Canvas::filled(24, 24, [0.4, 0.4, 0.4]);
+
+        let report = fit(&target, &cfg, |_| {}).unwrap();
+        assert_eq!(report.stop_reason, StopReason::Converged);
+        assert!(report.losses.len() < 1000, "ran {} iters", report.losses.len());
+    }
+
+    #[test]
+    fn invalid_configs_are_rejected() {
+        let target = Canvas::filled(16, 16, [0.5; 3]);
+        let cases = [
+            (FitConfig { triangles: 0, ..Default::default() }, ConfigError::NoTriangles),
+            (FitConfig { sigma_end: 0.0, ..Default::default() }, ConfigError::NonPositiveSigma),
+            (
+                FitConfig { sigma_start: f32::NAN, ..Default::default() },
+                ConfigError::NonPositiveSigma,
+            ),
+            (
+                FitConfig { sigma_start: 0.001, sigma_end: 0.5, ..Default::default() },
+                ConfigError::SigmaNotDecreasing,
+            ),
+            (
+                FitConfig { lr_pos: -1.0, ..Default::default() },
+                ConfigError::NonPositiveLearningRate,
+            ),
+        ];
+        for (cfg, expected) in cases {
+            assert_eq!(fit(&target, &cfg, |_| {}).unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn projection_replaces_non_finite_parameters() {
+        let mut p = vec![f32::NAN, f32::INFINITY, 0.5, 0.5, 0.5, 0.5, f32::NAN, 0.2, 0.3, f32::NAN];
+        project(&mut p);
+        assert!(p.iter().all(|v| v.is_finite()), "got {p:?}");
+    }
+
+    #[test]
+    fn zero_iterations_is_not_an_error() {
+        let cfg = FitConfig { triangles: 4, iters: 0, ..Default::default() };
+        let report = fit(&Canvas::filled(16, 16, [0.5; 3]), &cfg, |_| {}).unwrap();
+        assert!(report.losses.is_empty());
+        assert!(report.final_loss().is_nan());
+        assert_eq!(report.stop_reason, StopReason::Completed);
     }
 }
