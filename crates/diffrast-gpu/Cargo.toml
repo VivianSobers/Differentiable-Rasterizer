@@ -1,0 +1,19 @@
+[package]
+name = "diffrast-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU rasterizer and gradients via wgpu compute shaders"
+
+[dependencies]
+diffrast = { path = "../diffrast" }
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+rand = "0.8"
+
+
+[[bin]]
+name = "gpu_bench"
+path = "src/bin/gpu_bench.rs"
+required-features = []
