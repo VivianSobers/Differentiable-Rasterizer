@@ -28,6 +28,11 @@ impl RenderParams {
     }
 }
 
+/// Contributions below this weight are skipped. Forward and backward passes
+/// must use the same threshold, or the gradient will describe a slightly
+/// different function than the one actually rendered.
+pub(crate) const MIN_WEIGHT: f32 = 1e-6;
+
 /// Render a scene to a canvas, compositing triangles back-to-front.
 pub fn render(scene: &Scene, p: RenderParams) -> Canvas {
     let mut canvas = Canvas::filled(p.width, p.height, scene.background);
@@ -49,7 +54,7 @@ fn composite(canvas: &mut Canvas, tri: &Triangle, p: RenderParams) {
         for x in x0..x1 {
             let pt = pixel_center(x, y, p);
             let w = alpha * coverage(tri, pt, p.sigma);
-            if w <= 1e-6 {
+            if w <= MIN_WEIGHT {
                 continue;
             }
             let dst = canvas.get(x, y);
@@ -135,7 +140,7 @@ pub fn pixel_center(x: usize, y: usize, p: RenderParams) -> [f32; 2] {
 
 /// Pixel-space bounding box for a triangle, padded by the softness radius.
 /// Returns `None` when the triangle is entirely off-canvas.
-fn pixel_bounds(tri: &Triangle, p: RenderParams) -> Option<(usize, usize, usize, usize)> {
+pub(crate) fn pixel_bounds(tri: &Triangle, p: RenderParams) -> Option<(usize, usize, usize, usize)> {
     let pad = p.cull_radius();
     let (mut lo_x, mut lo_y) = (f32::INFINITY, f32::INFINITY);
     let (mut hi_x, mut hi_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
