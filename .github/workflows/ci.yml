@@ -39,6 +39,9 @@ jobs:
 
       # The gradient is the part most likely to break silently, so the smoke
       # test asserts a real fit still converges rather than merely compiling.
+      - name: Benchmarks
+        run: cargo bench
+
       - name: Smoke test a fit
         run: |
           cargo run --release --bin fit -- --tris 32 --iters 200 --size 96 --quiet
@@ -71,7 +74,18 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r python/requirements.txt
+        run: |
+          pip install -r python/requirements.txt
+          pip install maturin torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+      # Builds the PyO3 extension so the torch-layer tests actually run;
+      # without it they self-skip and the gradient check silently stops
+      # guarding anything.
+      - name: Build python extension
+        run: maturin build --release --manifest-path crates/diffrast-py/Cargo.toml --out dist
+
+      - name: Install extension
+        run: pip install --no-deps --force-reinstall dist/*.whl
 
       - name: Lint
         run: python -m compileall -q python
