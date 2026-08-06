@@ -8,6 +8,7 @@ description = "Differentiable 2D triangle rasterizer"
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 rand = "0.8"
+rayon = "1.10"
 
 [[bin]]
 name = "render"
