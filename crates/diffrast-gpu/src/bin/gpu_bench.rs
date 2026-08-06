@@ -6,7 +6,9 @@
 
 use std::time::Instant;
 
-use diffrast::grad::{backward as cpu_backward, render_with_tape};
+use diffrast::grad::{
+    backward as cpu_backward, backward_batch as cpu_backward_batch, render_with_tape,
+};
 use diffrast::raster::{render as cpu_render, RenderParams};
 use diffrast::{Canvas, Scene};
 use diffrast_gpu::{BackwardMode, GpuRasterizer};
@@ -110,8 +112,41 @@ fn main() {
         );
     }
 
+    // The batch is the unit that matters for training, and on a fast device the
+    // per-dispatch overhead is most of what a single small render costs — so
+    // this is where the remaining time is expected to be.
+    println!(
+        "\n{:<28} {:>11} {:>11} {:>11} {:>9}",
+        "batched backward (128px)", "cpu rayon", "gpu 1-by-1", "gpu batched", "batch win"
+    );
+    for &batch in &[8usize, 32, 64] {
+        let tris = 64;
+        let p = RenderParams::new(128, 128, 0.01);
+        let scenes: Vec<Scene> = (0..batch).map(|_| scene_of(tris)).collect();
+        let targets: Vec<Canvas> =
+            (0..batch).map(|_| Canvas::filled(128, 128, [0.4, 0.5, 0.6])).collect();
+
+        let cpu_time = time(2, || cpu_backward_batch(&scenes, p, &targets));
+        let loop_time = time(2, || {
+            for (scene, target) in scenes.iter().zip(&targets) {
+                gpu.backward(scene, p, target).expect("backward");
+            }
+        });
+        let batch_time = time(2, || gpu.backward_many(&scenes, p, &targets).expect("batched"));
+
+        println!(
+            "{:<28} {:>10.2}ms {:>10.2}ms {:>10.2}ms {:>8.1}x",
+            format!("batch {batch}, {tris} tris"),
+            cpu_time * 1e3,
+            loop_time * 1e3,
+            batch_time * 1e3,
+            loop_time / batch_time
+        );
+    }
+
     println!(
         "\nnote: timings include buffer upload and readback, so short renders are\n\
-         dominated by transfer rather than compute."
+         dominated by transfer rather than compute. \"batch win\" isolates that:\n\
+         same total work, one dispatch instead of N."
     );
 }
