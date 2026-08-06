@@ -40,6 +40,12 @@ jobs:
       - name: Benchmarks
         run: cargo bench
 
+      # CI runners have no GPU, so the GPU tests skip themselves rather than
+      # fail. Compiling the shaders still catches WGSL errors, which is most of
+      # what breaks there.
+      - name: GPU crate builds and shaders validate
+        run: cargo build --release -p diffrast-gpu
+
       # The gradient is the part most likely to break silently, so the smoke
       # test asserts a real fit still converges rather than merely compiling.
       - name: Smoke test a fit
