@@ -1,0 +1,52 @@
+name: Deploy viewer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a queued run supersedes a pending one rather than
+# racing it, but an in-progress deploy is allowed to finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install wasm toolchain
+        run: |
+          rustup target add wasm32-unknown-unknown
+          curl -sSfL https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+
+      # Rebuilt from source rather than trusting the committed artifacts, so a
+      # stale checked-in bundle can never be what ships.
+      - name: Build viewer
+        working-directory: web
+        run: |
+          npm install
+          npm run all
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
