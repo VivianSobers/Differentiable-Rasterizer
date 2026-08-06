@@ -168,57 +168,170 @@ pub fn fit(
     cfg: &FitConfig,
     mut on_progress: impl FnMut(FitProgress),
 ) -> Result<FitReport, ConfigError> {
-    cfg.validate()?;
+    let mut fitter = Fitter::new(target.clone(), cfg.clone())?;
+    while let Some(step) = fitter.step() {
+        on_progress(FitProgress {
+            iter: step.iter,
+            loss: step.loss,
+            sigma: step.sigma,
+            scene: fitter.scene(),
+        });
+    }
+    Ok(fitter.into_report())
+}
 
-    let mut rng = StdRng::seed_from_u64(cfg.seed);
-    let mut scene = seed_scene(target, cfg, &mut rng);
+/// What one [`Fitter::step`] did.
+#[derive(Clone, Copy, Debug)]
+pub struct StepInfo {
+    pub iter: usize,
+    pub loss: f32,
+    pub sigma: f32,
+}
 
-    let mut params = scene.params();
-    let lr = learning_rates(cfg, scene.len());
-    let mut adam = Adam::new(params.len());
-    let mut losses = Vec::with_capacity(cfg.iters);
+/// A fit that can be advanced one iteration at a time.
+///
+/// [`fit`] is the batch form and covers most uses. This exists because some
+/// callers cannot own the loop: a browser has to yield to the event loop
+/// between frames, so it needs to drive iterations itself rather than hand
+/// control to a function that blocks until convergence.
+pub struct Fitter {
+    target: Canvas,
+    cfg: FitConfig,
+    scene: Scene,
+    params: Vec<f32>,
+    lr: Vec<f32>,
+    adam: Adam,
+    losses: Vec<f32>,
+    iter: usize,
+    since_improved: usize,
+    best_iter: usize,
+    best_loss: f32,
+    best_scene: Scene,
+    stop_reason: Option<StopReason>,
+}
 
-    let mut best = (0usize, f32::INFINITY, scene.clone());
-    let mut since_improved = 0usize;
-    let mut stop_reason = StopReason::Completed;
+impl Fitter {
+    pub fn new(target: Canvas, cfg: FitConfig) -> Result<Self, ConfigError> {
+        cfg.validate()?;
 
-    for i in 0..cfg.iters {
-        let sigma = sigma_at(cfg, i);
-        let rp = RenderParams::new(target.width, target.height, sigma);
+        let mut rng = StdRng::seed_from_u64(cfg.seed);
+        let scene = seed_scene(&target, &cfg, &mut rng);
+        let params = scene.params();
+        let lr = learning_rates(&cfg, scene.len());
+        let adam = Adam::new(params.len());
 
-        let (rendered, tape) = render_with_tape(&scene, rp);
-        let (loss, grads) = backward(&scene, rp, &tape, &rendered, target);
+        Ok(Self {
+            losses: Vec::with_capacity(cfg.iters),
+            best_scene: scene.clone(),
+            target,
+            cfg,
+            scene,
+            params,
+            lr,
+            adam,
+            iter: 0,
+            since_improved: 0,
+            best_iter: 0,
+            best_loss: f32::INFINITY,
+            stop_reason: None,
+        })
+    }
+
+    /// Advance one iteration. Returns `None` once the fit has stopped, for any
+    /// reason — the loop condition and the stop condition are the same thing,
+    /// so a caller cannot accidentally keep stepping past convergence.
+    pub fn step(&mut self) -> Option<StepInfo> {
+        if self.stop_reason.is_some() {
+            return None;
+        }
+        if self.iter >= self.cfg.iters {
+            self.stop_reason = Some(StopReason::Completed);
+            return None;
+        }
+
+        let i = self.iter;
+        let sigma = sigma_at(&self.cfg, i);
+        let rp = RenderParams::new(self.target.width, self.target.height, sigma);
+
+        let (rendered, tape) = render_with_tape(&self.scene, rp);
+        let (loss, grads) = backward(&self.scene, rp, &tape, &rendered, &self.target);
 
         // Bail before a non-finite loss can poison the optimizer state: once a
         // NaN enters Adam's moments it never leaves, and every subsequent
         // parameter silently becomes NaN too.
         if !loss.is_finite() {
-            stop_reason = StopReason::Diverged;
-            break;
+            self.stop_reason = Some(StopReason::Diverged);
+            return None;
         }
 
-        losses.push(loss);
-        if loss + cfg.min_delta < best.1 {
-            best = (i, loss, scene.clone());
-            since_improved = 0;
+        self.losses.push(loss);
+        if loss + self.cfg.min_delta < self.best_loss {
+            self.best_loss = loss;
+            self.best_iter = i;
+            self.best_scene = self.scene.clone();
+            self.since_improved = 0;
         } else {
-            since_improved += 1;
+            self.since_improved += 1;
+        }
+        self.iter += 1;
+
+        if self.cfg.patience.is_some_and(|p| self.since_improved >= p) {
+            self.stop_reason = Some(StopReason::Converged);
+            return Some(StepInfo { iter: i, loss, sigma });
         }
 
-        on_progress(FitProgress { iter: i, loss, sigma, scene: &scene });
+        self.adam.step(&mut self.params, &grads, &self.lr);
+        project(&mut self.params);
+        self.scene.set_params(&self.params);
 
-        if cfg.patience.is_some_and(|p| since_improved >= p) {
-            stop_reason = StopReason::Converged;
-            break;
-        }
-
-        adam.step(&mut params, &grads, &lr);
-        project(&mut params);
-        scene.set_params(&params);
+        Some(StepInfo { iter: i, loss, sigma })
     }
 
-    let (best_iter, best_loss, best_scene) = best;
-    Ok(FitReport { scene: best_scene, losses, stop_reason, best_iter, best_loss })
+    /// The scene as it currently stands — mid-optimization, not the best seen.
+    pub fn scene(&self) -> &Scene {
+        &self.scene
+    }
+
+    pub fn target(&self) -> &Canvas {
+        &self.target
+    }
+
+    pub fn iter(&self) -> usize {
+        self.iter
+    }
+
+    pub fn losses(&self) -> &[f32] {
+        &self.losses
+    }
+
+    pub fn best_loss(&self) -> f32 {
+        self.best_loss
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.stop_reason.is_some() || self.iter >= self.cfg.iters
+    }
+
+    /// Softness for the next iteration.
+    pub fn sigma(&self) -> f32 {
+        sigma_at(&self.cfg, self.iter.min(self.cfg.iters.saturating_sub(1)))
+    }
+
+    /// Render the current scene at its sharpest setting.
+    pub fn render_current(&self) -> Canvas {
+        let rp = RenderParams::new(self.target.width, self.target.height, self.cfg.sigma_end);
+        crate::raster::render(&self.scene, rp)
+    }
+
+    pub fn into_report(self) -> FitReport {
+        FitReport {
+            scene: self.best_scene,
+            losses: self.losses,
+            stop_reason: self.stop_reason.unwrap_or(StopReason::Completed),
+            best_iter: self.best_iter,
+            best_loss: self.best_loss,
+        }
+    }
 }
 
 /// Softness for iteration `i`, annealed geometrically from `sigma_start` to
@@ -455,6 +568,61 @@ mod tests {
         let mut p = vec![f32::NAN, f32::INFINITY, 0.5, 0.5, 0.5, 0.5, f32::NAN, 0.2, 0.3, f32::NAN];
         project(&mut p);
         assert!(p.iter().all(|v| v.is_finite()), "got {p:?}");
+    }
+
+    #[test]
+    fn stepping_matches_the_batch_loop() {
+        // The batch `fit` is implemented on top of `Fitter`, so these must
+        // agree exactly. If they ever diverge, one of the two paths has grown
+        // state the other does not share.
+        let cfg = FitConfig { triangles: 6, iters: 40, seed: 11, ..Default::default() };
+        let target = target_at(32);
+
+        let batch = fit(&target, &cfg, |_| {}).unwrap();
+
+        let mut fitter = Fitter::new(target.clone(), cfg.clone()).unwrap();
+        let mut stepped = Vec::new();
+        while let Some(info) = fitter.step() {
+            stepped.push(info.loss);
+        }
+        let report = fitter.into_report();
+
+        assert_eq!(batch.losses, stepped);
+        assert_eq!(batch.best_loss, report.best_loss);
+        assert_eq!(batch.scene.params(), report.scene.params());
+    }
+
+    #[test]
+    fn stepping_past_the_end_returns_none() {
+        let cfg = FitConfig { triangles: 4, iters: 3, patience: None, ..Default::default() };
+        let mut fitter = Fitter::new(Canvas::filled(16, 16, [0.3; 3]), cfg).unwrap();
+
+        for _ in 0..3 {
+            assert!(fitter.step().is_some());
+        }
+        assert!(fitter.step().is_none());
+        assert!(fitter.step().is_none(), "repeated calls must stay terminated");
+        assert!(fitter.is_done());
+        assert_eq!(fitter.iter(), 3);
+    }
+
+    #[test]
+    fn fitter_exposes_live_state() {
+        let cfg = FitConfig { triangles: 5, iters: 20, ..Default::default() };
+        let mut fitter = Fitter::new(target_at(24), cfg).unwrap();
+        fitter.step();
+
+        assert_eq!(fitter.scene().len(), 5);
+        assert_eq!(fitter.losses().len(), 1);
+        assert!(fitter.sigma() > 0.0);
+        let img = fitter.render_current();
+        assert_eq!((img.width, img.height), (24, 24));
+    }
+
+    #[test]
+    fn fitter_rejects_invalid_config() {
+        let cfg = FitConfig { triangles: 0, ..Default::default() };
+        assert!(Fitter::new(Canvas::filled(8, 8, [0.5; 3]), cfg).is_err());
     }
 
     #[test]
