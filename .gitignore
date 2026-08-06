@@ -1,0 +1,7 @@
+/target
+/out
+*.png
+!docs/*.png
+__pycache__/
+.venv/
+node_modules/
