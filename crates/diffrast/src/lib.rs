@@ -16,7 +16,7 @@ pub mod scene;
 pub mod serial;
 
 pub use canvas::{fit_within, Canvas};
-pub use fit::{fit, ConfigError, FitConfig, FitProgress, FitReport, StopReason};
+pub use fit::{fit, ConfigError, FitConfig, FitProgress, FitReport, Fitter, StepInfo, StopReason};
 pub use grad::{backward, finite_difference, render_with_tape, Tape};
 pub use optim::Adam;
 pub use raster::{render, RenderParams};
