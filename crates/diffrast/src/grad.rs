@@ -18,6 +18,8 @@
 //! `triangles * canvas`, which for a few hundred small triangles is a large
 //! difference.
 
+use rayon::prelude::*;
+
 use crate::canvas::Canvas;
 use crate::raster::{self, RenderParams, MIN_WEIGHT};
 use crate::scene::{Scene, Triangle};
@@ -112,51 +114,101 @@ pub fn backward(
         rendered.data.iter().zip(&target.data).map(|(r, t)| scale * (r - t)).collect();
 
     // Front-to-back: the reverse of the compositing order.
+    //
+    // This loop is sequential by nature and cannot be parallelized over
+    // triangles: each one both reads and attenuates `d_canvas`, so triangle k
+    // must see the value triangle k+1 left behind. Rows within a triangle are
+    // independent, but they are far too small to be worth a fork-join. The
+    // parallelism in this crate lives one level up, in `backward_batch`, where
+    // whole independent images are the unit of work.
     for (k, tri) in scene.tris.iter().enumerate().rev() {
         let Some(patch) = tape.patches[k].as_ref() else { continue };
         let g = &mut grads[k * Triangle::N_PARAMS..(k + 1) * Triangle::N_PARAMS];
-        let alpha = tri.alpha.clamp(0.0, 1.0);
-        // A clamped alpha is locally constant, so no gradient flows to it.
-        let alpha_active = tri.alpha > 0.0 && tri.alpha < 1.0;
-
-        let row_len = (patch.x1 - patch.x0) * 3;
-        for y in patch.y0..patch.y1 {
-            for x in patch.x0..patch.x1 {
-                let pt = raster::pixel_center(x, y, p);
-                let (cov, d_cov_d_verts) = coverage_with_grad(tri, pt, p.sigma);
-                let w = alpha * cov;
-                if w <= MIN_WEIGHT {
-                    continue;
-                }
-
-                let off = (y - patch.y0) * row_len + (x - patch.x0) * 3;
-                let dst = &patch.before[off..off + 3];
-                let di = rendered.idx(x, y);
-                let d_out = [d_canvas[di], d_canvas[di + 1], d_canvas[di + 2]];
-
-                // out = color * w + dst * (1 - w)
-                let mut d_w = 0.0;
-                for ch in 0..3 {
-                    g[6 + ch] += d_out[ch] * w;
-                    d_w += d_out[ch] * (tri.color[ch] - dst[ch]);
-                    // What reaches the layers underneath, attenuated by this one.
-                    d_canvas[di + ch] = d_out[ch] * (1.0 - w);
-                }
-
-                // w = alpha * coverage
-                if alpha_active {
-                    g[9] += d_w * cov;
-                }
-                let d_cov = d_w * alpha;
-                for v in 0..3 {
-                    g[v * 2] += d_cov * d_cov_d_verts[v][0];
-                    g[v * 2 + 1] += d_cov * d_cov_d_verts[v][1];
-                }
-            }
-        }
+        backward_one(tri, p, patch, rendered, &mut d_canvas, g);
     }
 
     (loss, grads)
+}
+
+/// Accumulate one triangle's gradients and attenuate `d_canvas` for the layers
+/// beneath it.
+fn backward_one(
+    tri: &Triangle,
+    p: RenderParams,
+    patch: &Patch,
+    rendered: &Canvas,
+    d_canvas: &mut [f32],
+    g: &mut [f32],
+) {
+    let alpha = tri.alpha.clamp(0.0, 1.0);
+    // A clamped alpha is locally constant, so no gradient flows to it.
+    let alpha_active = tri.alpha > 0.0 && tri.alpha < 1.0;
+
+    let row_len = (patch.x1 - patch.x0) * 3;
+    for y in patch.y0..patch.y1 {
+        for x in patch.x0..patch.x1 {
+            let pt = raster::pixel_center(x, y, p);
+            let (cov, d_cov_d_verts) = coverage_with_grad(tri, pt, p.sigma);
+            let w = alpha * cov;
+            if w <= MIN_WEIGHT {
+                continue;
+            }
+
+            let off = (y - patch.y0) * row_len + (x - patch.x0) * 3;
+            let dst = &patch.before[off..off + 3];
+            let di = rendered.idx(x, y);
+            let d_out = [d_canvas[di], d_canvas[di + 1], d_canvas[di + 2]];
+
+            // out = color * w + dst * (1 - w)
+            let mut d_w = 0.0;
+            for ch in 0..3 {
+                g[6 + ch] += d_out[ch] * w;
+                d_w += d_out[ch] * (tri.color[ch] - dst[ch]);
+                // What reaches the layers underneath, attenuated by this one.
+                d_canvas[di + ch] = d_out[ch] * (1.0 - w);
+            }
+
+            // w = alpha * coverage
+            if alpha_active {
+                g[9] += d_w * cov;
+            }
+            let d_cov = d_w * alpha;
+            for v in 0..3 {
+                g[v * 2] += d_cov * d_cov_d_verts[v][0];
+                g[v * 2 + 1] += d_cov * d_cov_d_verts[v][1];
+            }
+        }
+    }
+}
+
+/// Render and differentiate a batch of independent scenes in parallel.
+///
+/// This is the unit of work that actually parallelizes well. A single fit is a
+/// chain of sequential steps, but training a network that *predicts* scenes
+/// evaluates a whole batch of unrelated images at once — and those share
+/// nothing, so they scale across cores almost linearly.
+///
+/// Returns one `(loss, gradients)` pair per item, in input order.
+pub fn backward_batch(
+    scenes: &[Scene],
+    p: RenderParams,
+    targets: &[Canvas],
+) -> Vec<(f32, Vec<f32>)> {
+    assert_eq!(scenes.len(), targets.len(), "batch size mismatch");
+
+    scenes
+        .par_iter()
+        .zip(targets.par_iter())
+        .map(|(scene, target)| {
+            let (rendered, tape) = render_with_tape(scene, p);
+            backward(scene, p, &tape, &rendered, target)
+        })
+        .collect()
+}
+
+/// Render a batch of scenes in parallel.
+pub fn render_batch(scenes: &[Scene], p: RenderParams) -> Vec<Canvas> {
+    scenes.par_iter().map(|scene| crate::raster::render(scene, p)).collect()
 }
 
 /// Coverage at `pt` together with its derivative w.r.t. each of the three
@@ -344,6 +396,67 @@ mod tests {
             let (a, n) = (analytic[6 + ch], numeric[6 + ch]);
             assert!((a - n).abs() / n.abs().max(1e-6) < 0.01, "channel {ch}: {a} vs {n}");
         }
+    }
+
+    #[test]
+    fn batch_gradients_match_sequential_ones() {
+        // Parallelism must not change the numbers. Each item is independent,
+        // so batching is purely a scheduling decision.
+        let (scene, target, p) = scene_pair(0.02);
+
+        let scenes: Vec<Scene> = (0..4).map(|_| scene.clone()).collect();
+        let targets: Vec<Canvas> = (0..4).map(|_| target.clone()).collect();
+
+        let batched = backward_batch(&scenes, p, &targets);
+
+        let (rendered, tape) = render_with_tape(&scene, p);
+        let (loss, grads) = backward(&scene, p, &tape, &rendered, &target);
+
+        assert_eq!(batched.len(), 4);
+        for (b_loss, b_grads) in &batched {
+            assert_eq!(*b_loss, loss);
+            assert_eq!(*b_grads, grads);
+        }
+    }
+
+    #[test]
+    fn batch_render_matches_sequential_render() {
+        let (scene, _, p) = scene_pair(0.01);
+        let scenes: Vec<Scene> = (0..3).map(|_| scene.clone()).collect();
+
+        for img in render_batch(&scenes, p) {
+            assert_eq!(img.data, raster::render(&scene, p).data);
+        }
+    }
+
+    #[test]
+    fn batch_preserves_input_order() {
+        // Rayon completes work out of order; the results must not come back
+        // shuffled, or a training batch would be paired with the wrong labels.
+        let p = RenderParams::new(16, 16, 0.02);
+        let mut scenes = Vec::new();
+        let mut targets = Vec::new();
+        for i in 0..6 {
+            let shade = i as f32 / 6.0;
+            let mut s = Scene::new([shade, shade, shade]);
+            s.push(Triangle::new([[0.2, 0.2], [0.8, 0.3], [0.5, 0.8]], [1.0, 0.0, 0.0], 0.5));
+            scenes.push(s);
+            targets.push(Canvas::filled(16, 16, [1.0 - shade, 0.5, 0.5]));
+        }
+
+        let batched = backward_batch(&scenes, p, &targets);
+        for (i, (loss, _)) in batched.iter().enumerate() {
+            let (rendered, tape) = render_with_tape(&scenes[i], p);
+            let (expected, _) = backward(&scenes[i], p, &tape, &rendered, &targets[i]);
+            assert_eq!(*loss, expected, "item {i} out of order");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "batch size mismatch")]
+    fn mismatched_batch_sizes_panic() {
+        let p = RenderParams::new(8, 8, 0.02);
+        backward_batch(&[Scene::new([0.0; 3])], p, &[]);
     }
 
     #[test]
