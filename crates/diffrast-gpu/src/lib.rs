@@ -31,7 +31,8 @@ struct GpuParams {
     background: [f32; 3],
     min_weight: f32,
     write_tape: u32,
-    _pad: [u32; 3],
+    grad_input: u32,
+    _pad: [u32; 2],
 }
 
 /// Something went wrong talking to the GPU.
@@ -277,7 +278,8 @@ impl GpuRasterizer {
             // Must match `raster::MIN_WEIGHT` on the CPU side.
             min_weight: 1e-6,
             write_tape: write_tape as u32,
-            _pad: [0; 3],
+            grad_input: 0,
+            _pad: [0; 2],
         }
     }
 
@@ -648,6 +650,84 @@ impl GpuRasterizer {
         Ok((out, t))
     }
 
+    /// Gradients from an upstream image gradient rather than a target.
+    ///
+    /// This is the shape autograd needs: PyTorch hands the layer `dL/d(pixel)`
+    /// and expects `dL/d(parameter)` back. Deriving an equivalent target from
+    /// the gradient would work, but only after rendering once to invert
+    /// `d(mse)/dr = 2(r - t)/N` — so the shader reads the gradient directly
+    /// instead, and the batch is rendered exactly once.
+    ///
+    /// `grad_images` is `(batch, height, width, 3)` flattened, matching the
+    /// layout `render_many` produces.
+    pub fn backward_many_from_grad(
+        &self,
+        scenes: &[Scene],
+        p: RenderParams,
+        grad_images: &[f32],
+    ) -> Result<Vec<Vec<f32>>, GpuError> {
+        let Some(n_tris) = self.check_batch(scenes)? else {
+            return Ok(Vec::new());
+        };
+        let batch = scenes.len();
+        let pixels = p.width * p.height;
+
+        let expected = batch * pixels * 3;
+        if grad_images.len() != expected {
+            return Err(GpuError::TooLarge(format!(
+                "expected {expected} gradient values, got {}",
+                grad_images.len()
+            )));
+        }
+
+        let packed = self.pack_batch_with(scenes, p, n_tris, true);
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let image_buf = self.encode_forward(&mut encoder, &packed, p, batch);
+
+        let grad_in_buf = self.storage("grad_in", grad_images);
+        let grad_len = batch * n_tris * Triangle::N_PARAMS;
+        let grad_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("grads"),
+            contents: bytemuck::cast_slice(&vec![0.0f32; grad_len]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("backward_batch_grad"),
+            layout: &self.backward_batch_reduced.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: packed.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: packed.tris.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: image_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: grad_in_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: packed.backgrounds.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("backward_batch_grad"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.backward_batch_reduced);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(
+                p.width.div_ceil(8) as u32,
+                p.height.div_ceil(8) as u32,
+                batch as u32,
+            );
+        }
+
+        let grads = self.read_buffer(&mut encoder, &grad_buf, (grad_len * 4) as u64)?;
+        let stride = n_tris * Triangle::N_PARAMS;
+        Ok(grads.chunks_exact(stride).map(|g| g.to_vec()).collect())
+    }
+
     /// Validates a batch and returns its shared triangle count.
     /// `Ok(None)` means the batch was empty.
     fn check_batch(&self, scenes: &[Scene]) -> Result<Option<usize>, GpuError> {
@@ -669,10 +749,21 @@ impl GpuRasterizer {
 
     /// Per-batch buffers, uploaded once and reused by both dispatches.
     fn pack_batch(&self, scenes: &[Scene], p: RenderParams, n_tris: usize) -> PackedBatch {
+        self.pack_batch_with(scenes, p, n_tris, false)
+    }
+
+    fn pack_batch_with(
+        &self,
+        scenes: &[Scene],
+        p: RenderParams,
+        n_tris: usize,
+        grad_input: bool,
+    ) -> PackedBatch {
         let tris: Vec<f32> = scenes.iter().flat_map(|s| s.params()).collect();
         let backgrounds: Vec<f32> = scenes.iter().flat_map(|s| s.background).collect();
         let mut params = Self::gpu_params(&scenes[0], p, false);
         params.n_tris = n_tris as u32;
+        params.grad_input = u32::from(grad_input);
 
         PackedBatch {
             params: self.uniform(&params),
@@ -1096,6 +1187,48 @@ mod tests {
             let err = max_abs_diff(&cpu_grads, &out[0].1) / norm;
             assert!(err < 1e-3, "{w}x{h} with {tris} triangles: error {err}");
         }
+    }
+
+    #[test]
+    fn gradient_input_mode_matches_target_mode() {
+        // Feeding the shader d(mse)/d(pixel) directly must reproduce what it
+        // computes internally from a target. This is the path autograd uses,
+        // so a discrepancy would corrupt every trained model while leaving the
+        // standalone fitter perfectly correct.
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(32, 32, 0.02);
+        let scenes: Vec<Scene> = (0..3).map(|_| test_scene(8)).collect();
+        let targets: Vec<Canvas> =
+            (0..3).map(|i| Canvas::filled(32, 32, [0.2 * i as f32, 0.5, 0.7])).collect();
+
+        let via_target = gpu.backward_many(&scenes, p, &targets).expect("target mode");
+
+        // Build the equivalent upstream gradient: d(mse)/dr = 2(r - t)/N.
+        let rendered = gpu.render_many(&scenes, p).expect("render");
+        let n = (32 * 32 * 3) as f32;
+        let grad_in: Vec<f32> = rendered
+            .iter()
+            .zip(&targets)
+            .flat_map(|(r, t)| {
+                r.data.iter().zip(&t.data).map(|(a, b)| 2.0 * (a - b) / n).collect::<Vec<_>>()
+            })
+            .collect();
+
+        let via_grad = gpu.backward_many_from_grad(&scenes, p, &grad_in).expect("grad mode");
+
+        for (i, ((_, a), b)) in via_target.iter().zip(&via_grad).enumerate() {
+            let norm = a.iter().map(|g| g * g).sum::<f32>().sqrt().max(1e-12);
+            let err = max_abs_diff(a, b) / norm;
+            assert!(err < 1e-3, "item {i}: relative difference {err}");
+        }
+    }
+
+    #[test]
+    fn gradient_input_rejects_wrong_length() {
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(16, 16, 0.02);
+        let scenes = vec![test_scene(4)];
+        assert!(gpu.backward_many_from_grad(&scenes, p, &[0.0; 10]).is_err());
     }
 
     #[test]
