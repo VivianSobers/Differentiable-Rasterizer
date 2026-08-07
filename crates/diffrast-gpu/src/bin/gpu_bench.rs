@@ -247,10 +247,12 @@ fn main() {
         );
     }
 
+    println!("pool after the breakdown: {:?}", gpu.pool_stats());
+
     println!(
-        "\nnote: timings include buffer upload and readback, so short renders are\n\
-         dominated by transfer rather than compute. \"batch win\" isolates that:\n\
-         same total work, one dispatch instead of N. The crossover table is the\n\
-         one to read before choosing a device for training."
+        "\nnote: the breakdown waits for the queue between phases so each one\n\
+         measures its own work, which makes its total an upper bound — compare\n\
+         phases against each other, not this total against the tables above.\n\
+         The crossover table is the one to read before choosing a device."
     );
 }
