@@ -135,8 +135,11 @@ render comparisons while B keeps training.
 
 Three things, in order of usefulness:
 
-1. `docs/gpu-report.txt` from `scripts/collect-gpu-report.sh` — decides whether
-   the GPU backward is worth optimizing further or needs the tiled rewrite.
+1. `docs/gpu-report.txt` from `scripts/collect-gpu-report.sh`. Two sections
+   matter now: `gradient reduction` shows what the workgroup reduction bought,
+   and `crossover` decides where `--raster-device auto` should switch over. The
+   crossover figures currently in the README predate the reduction and
+   understate the GPU.
 2. `runs/*/history.json` — shows whether the amortized model is actually
    learning or just memorizing the warm start.
 3. Peak GPU memory during training (`nvidia-smi` during a run) — tells us how

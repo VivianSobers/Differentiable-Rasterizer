@@ -215,6 +215,11 @@ ends with a crossover table so the dispatch rule is read off measured data.
 
 ### The crossover, and what it exposed
 
+> **These numbers predate the workgroup reduction below**, which made the GPU
+> backward 2-7x faster. They are kept because they are what located the
+> bottleneck; the `cpu` cells in particular should be re-measured before being
+> used to choose a device. `./scripts/collect-gpu-report.sh` regenerates them.
+
 Batch of 16 on an idle 4090 vs 26 CPU cores — `gpu/cpu` above 1.0 means the GPU
 wins:
 
