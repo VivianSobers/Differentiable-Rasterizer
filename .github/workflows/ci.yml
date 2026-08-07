@@ -90,8 +90,11 @@ jobs:
       - name: Build python extension
         run: maturin build --release --manifest-path crates/diffrast-py/Cargo.toml --out dist
 
+      # A single explicit wheel: maturin can leave both a manylinux- and a
+      # linux-tagged build in the directory, and a glob matching both makes pip
+      # fail with an unresolvable conflict.
       - name: Install extension
-        run: pip install --no-deps --force-reinstall dist/*.whl
+        run: pip install --no-deps --force-reinstall "$(ls -t dist/*.whl | head -1)"
 
       - name: Lint
         run: python -m compileall -q python
