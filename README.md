@@ -83,14 +83,21 @@ python python/precompute.py --data photos/ --out data/fits.pt
 torchrun --nproc_per_node=2 python/train.py --pretrain data/fits.pt
 ```
 
-**A note on where the time goes.** The rasterizer runs on CPU, so a naive
-end-to-end loop is bottlenecked by rendering and the GPUs idle. Training is
-staged around that: `precompute.py` fits a corpus once, in parallel across
-cores, and `train.py --pretrain` then trains on those pairs as pure GPU work.
-End-to-end fine-tuning applies the render loss to a fraction of each batch
-(`--render-fraction`), which makes steps far cheaper at the cost of a noisier
-gradient. A GPU rasterizer would remove the constraint entirely — it's the
-biggest single improvement left, and it's on the roadmap below.
+**Choosing a backend.** The rasterizer runs on CPU or GPU, selected with
+`--raster-device` (or `device=` on `rasterize`). This is independent of the
+torch device: the extension carries its own wgpu context, and tensors always
+cross the boundary as CPU float32.
+
+`auto` picks from the measured crossover rather than assuming the GPU is
+faster — it is not, below roughly 64 triangles, where there are too few
+gradient accumulators to spread contention across and a many-core CPU
+parallelizing over batch items wins outright. `last_device()` reports what a
+call actually used, which is worth checking: an earlier version of the binding
+parsed `device` and silently ignored it, and timings alone did not reveal it.
+
+Training is still staged so the GPUs are never idle: `precompute.py` fits a
+corpus once in parallel across cores, and `train.py --pretrain` trains on those
+pairs with no rasterizer in the loop at all.
 
 The parameter-supervision term is deliberately decayed to zero over training.
 Many different triangle sets render to the same image, so matching a particular
@@ -404,8 +411,6 @@ sigma a fit ends on.
 
 ## Roadmap
 
-- **Route the PyTorch layer through the GPU rasterizer.** The bindings currently
-  call the CPU path, which is what makes end-to-end training CPU-bound.
 - **Per-workgroup gradient reduction.** The measured bottleneck: 86.6% of a
   batched backward call is dispatch, and the evidence points squarely at atomic
   contention. See the profile above for the design and its barrier-uniformity
