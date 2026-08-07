@@ -99,11 +99,28 @@ def rasterize(
     return images.permute(0, 3, 1, 2).contiguous() if channels_first else images
 
 
+def gpu_adapter() -> str | None:
+    """Name of the GPU the extension will use, or `None` if there is none."""
+    return diffrast_rs.gpu_adapter()
+
+
+def last_device() -> str:
+    """Device the most recent `fused_loss` call actually ran on.
+
+    Worth having: with `device="auto"` and a silent CPU fallback, "it got
+    faster" is not evidence that the GPU was used. Tests assert on this
+    instead — a bug that quietly routed everything to the CPU passed a
+    timing-based check once already.
+    """
+    return diffrast_rs.last_device()
+
+
 def fused_loss(
     params: Tensor,
     targets: Tensor,
     sigma: float = 0.0015,
     background: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    device: str = "auto",
 ) -> tuple[Tensor, Tensor]:
     """Per-item MSE and parameter gradients in one call, without autograd.
 
@@ -111,6 +128,12 @@ def fused_loss(
     never materializes the rendered images in Python, which is a meaningful
     saving when the batch is large. For training a *network*, use `rasterize`
     instead: this returns gradients rather than routing them.
+
+    Args:
+        device: `"cpu"`, `"gpu"`, or `"auto"`. `"auto"` picks from the measured
+            crossover — the GPU only pulls ahead once there is enough geometry
+            to spread gradient-accumulator contention across, and below that a
+            many-core CPU parallelizing over batch items wins outright.
 
     Returns:
         `(losses, grads)` — `(B,)` and `(B, T, 10)`.
@@ -121,7 +144,9 @@ def fused_loss(
     params_np = params.detach().to("cpu", torch.float32).contiguous().numpy()
     targets_np = targets.detach().to("cpu", torch.float32).contiguous().numpy()
 
-    losses, grads = diffrast_rs.fused_loss_backward(params_np, targets_np, sigma, background)
+    losses, grads = diffrast_rs.fused_loss_backward(
+        params_np, targets_np, sigma, background, device
+    )
     return (
         torch.tensor(losses, device=params.device),
         torch.from_numpy(grads).to(params.device, params.dtype),
