@@ -205,6 +205,7 @@ name = "diffrast-py"
 version = "0.1.0"
 dependencies = [
  "diffrast",
+ "diffrast-gpu",
  "numpy",
  "pyo3",
  "rayon",
