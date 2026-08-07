@@ -237,9 +237,61 @@ are still read back once, because the loss is reduced on the host; moving that
 reduction onto the GPU would remove the last per-pixel transfer, and is the next
 thing worth doing.
 
-The general lesson is why the crossover table exists at all: the profile said
-"the GPU is slow at high resolution", and the true statement was "this code
-copies every pixel across PCIe twice".
+That fix was real but small — 3-9% at 256px. It was not the bottleneck, and
+predicting that it would be was wrong. Which is what the phase breakdown is for.
+
+### Where the time actually goes
+
+`backward_many_timed` reports each phase. On an idle 4090, batch of 16, 32
+triangles:
+
+| resolution | pack | alloc | dispatch | readback | loss | total |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64x64 | 0.02 ms | 0.26 ms | 0.76 ms | 0.15 ms | 0.06 ms | 1.25 ms |
+| 128x128 | 0.02 ms | 0.99 ms | 5.84 ms | 0.41 ms | 0.18 ms | 7.44 ms |
+| 256x256 | 0.03 ms | 6.09 ms | **73.43 ms** | 4.43 ms | 0.79 ms | 84.77 ms |
+
+Dispatch is **86.6%**. Transfers and host-side work together are under 7%, which
+settles it: the cost is GPU execution, and every plumbing optimization —
+including the one above — was addressing the wrong 7%.
+
+### The bottleneck is atomic contention
+
+Gradients accumulate per triangle while threads run per pixel, so every pixel
+that a triangle covers does a compare-exchange against the same ten floats.
+Four independent observations all point there:
+
+1. **Dispatch scales 12.6x for 4x the pixels.** More pixels means more threads
+   contending for the same accumulators, and CAS retries grow faster than
+   linearly with contention.
+2. **Per-triangle cost falls 7.2x as triangles increase.** At 256px, going from
+   32 to 512 triangles is 16x the work but only 2.2x the time — because 320
+   accumulator slots become 5120, and the contention spreads out.
+3. **The forward pass, which has no atomics, scales cleanly** and reaches 73.5x.
+   It shares the same geometry, the same culling, the same memory layout. The
+   accumulation is the only difference.
+4. **The GPU wins exactly where contention is lowest** — many triangles, which
+   is also where the crossover table flips to `GPU`.
+
+The fix is a per-workgroup reduction: accumulate into workgroup-shared memory
+first, then perform one global atomic per triangle per workgroup instead of one
+per pixel. With a 64-thread workgroup that is up to 64x fewer global atomics.
+
+It needs care rather than enthusiasm. `workgroupBarrier` must be reached by
+every thread in the workgroup, and the current shader both `return`s early for
+out-of-range pixels and `continue`s past culled triangles — either would make a
+barrier non-uniform, which is undefined behaviour rather than a wrong answer.
+The restructure is: drop the early return in favour of a predicate, process
+triangles in fixed-size chunks so the barriers sit in uniform control flow, and
+flush each chunk's partials to global memory before the next.
+
+### The general lesson
+
+The profile said "the GPU is slow at high resolution". The first answer was "it
+copies every pixel across PCIe twice" — true, and worth 3-9%. The real answer
+was "thousands of threads are queuing for ten floats". Two wrong diagnoses
+preceded the right one, and what separated them was instrumenting the thing
+instead of reasoning about it.
 
 ### How batching is implemented
 
@@ -333,9 +385,13 @@ sigma a fit ends on.
 
 - **Route the PyTorch layer through the GPU rasterizer.** The bindings currently
   call the CPU path, which is what makes end-to-end training CPU-bound.
+- **Per-workgroup gradient reduction.** The measured bottleneck: 86.6% of a
+  batched backward call is dispatch, and the evidence points squarely at atomic
+  contention. See the profile above for the design and its barrier-uniformity
+  hazard.
 - **Tiled binning.** Per-tile triangle lists would stop the shader visiting
-  every (pixel, triangle) pair. Lower priority than it looked from the
-  integrated-GPU profile — the 4090 rejects culled pairs almost for free.
+  every (pixel, triangle) pair. Lower priority — the 4090 rejects culled pairs
+  almost for free, and contention dominates.
 - **Gaussian primitives** alongside triangles, closer to how 3D Gaussian
   splatting parameterizes scenes.
 - **Perceptual loss** (LPIPS) in place of MSE, which over-rewards blur.
