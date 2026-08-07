@@ -183,13 +183,32 @@ triangle count (1.07x at 64 triangles, 1.49x at 512), and it held on both an
 integrated AMD card and the 4090, which is about as much evidence as a design
 choice like this can ask for. Both are kept, with a test asserting they agree.
 
-### Batched dispatch
+### Batching, and where the GPU actually wins
 
-`render_many` and `backward_many` submit a whole batch as one dispatch. This was
-built because the profile pointed at it: 4x the geometry costing 1.08x the time
-means small renders are paying a fixed per-call price — upload, dispatch,
-readback — rather than doing arithmetic. Batching pays that once instead of once
-per item.
+`render_many` and `backward_many` submit a whole batch as one dispatch, which
+removes the per-call overhead the profile pointed at. It works — **2.8-3.5x**
+over dispatching one at a time, on both 4090 boxes.
+
+It also does not do what I expected, which is the more useful result:
+
+| batch of 64, 128px, 64 tris | CPU rayon (26 cores) | GPU one-by-one | GPU batched |
+| --- | --- | --- | --- |
+| worker-2 | **21.5 ms** | 135.0 ms | 45.4 ms |
+
+Batching is 3x faster than not batching, and still **2x slower than the CPU**.
+At small per-item work the CPU parallelizes across batch items nearly perfectly
+— 26 cores on 64 independent images — while the GPU pays upload and readback for
+a workload too small to amortize them. The GPU's 4.7x win at 256px with 512
+triangles is real, and so is the CPU's 2x win at 128px with 64 triangles; they
+are different regimes, not a contradiction.
+
+The consequence for training: **routing the PyTorch layer to the GPU
+unconditionally would be a regression** for typical configurations (64-128px,
+modest triangle counts). `gpu_bench` now ends with a crossover table sweeping
+resolution against triangle count so the dispatch rule can be read off measured
+data rather than assumed.
+
+### How batching is implemented
 
 The scene index rides in the dispatch's `z` dimension and triangles are addressed
 as `batch * n_tris + i`, so every accessor in `common.wgsl` works unchanged.
@@ -201,6 +220,21 @@ Only the recompute strategy is offered batched. A batched tape would need
 `batch x triangles x pixels x 3` floats — 12 GB for a batch of 32 at 256px with
 512 triangles, which exceeds a 4090's memory for a workload that otherwise fits
 comfortably.
+
+### Two 4090s, two different answers
+
+The same benchmark on two nominally identical boxes:
+
+| forward, 512px, 1024 tris | GPU time | speedup |
+| --- | --- | --- |
+| worker-2 (idle card) | 1.35 ms | **71x** |
+| worker-1 (desktop daemon on card) | 3.27 ms | 28x |
+
+CPU times were within 5% of each other, so the difference is the GPU: worker-1
+runs `gnome-remote-desktop-daemon` holding ~1 GB of its card, and a newer
+driver. Benchmarks belong on the idle box. This is why the report script now
+lists GPU processes before it starts — the earlier version would have reported
+the 28x without any indication of why.
 
 ### A note on how this was measured
 
