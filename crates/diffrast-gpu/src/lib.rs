@@ -17,6 +17,7 @@ use bytemuck::{Pod, Zeroable};
 use diffrast::canvas::Canvas;
 use diffrast::raster::RenderParams;
 use diffrast::scene::{Scene, Triangle};
+use rayon::prelude::*;
 use wgpu::util::DeviceExt;
 
 /// Must match the `Params` struct in `common.wgsl`, including padding.
@@ -66,6 +67,33 @@ impl std::fmt::Display for GpuError {
 }
 
 impl std::error::Error for GpuError {}
+
+/// Where the time went inside one [`GpuRasterizer::backward_many`] call.
+///
+/// Added after two wrong guesses about the bottleneck. Extrapolating the
+/// benchmark to zero triangles left ~79 ms per batch at 256px that no amount of
+/// geometry explained, and reasoning about which line was responsible produced
+/// the wrong answer twice. Measuring each phase is cheaper than another guess.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BackwardTimings {
+    /// Creating and filling the triangle, background and parameter buffers.
+    pub pack_ms: f32,
+    /// Allocating the image, target and gradient buffers.
+    pub alloc_ms: f32,
+    /// Recording both passes and waiting for the gradients — includes all GPU
+    /// execution, since reading the gradients forces a full sync.
+    pub dispatch_ms: f32,
+    /// Copying the rendered images back to the host.
+    pub readback_ms: f32,
+    /// Reducing the per-item loss on the CPU.
+    pub loss_ms: f32,
+}
+
+impl BackwardTimings {
+    pub fn total_ms(&self) -> f32 {
+        self.pack_ms + self.alloc_ms + self.dispatch_ms + self.readback_ms + self.loss_ms
+    }
+}
 
 /// Buffers for one batch, uploaded once and shared by both dispatches.
 struct PackedBatch {
@@ -460,6 +488,23 @@ impl GpuRasterizer {
         p: RenderParams,
         targets: &[Canvas],
     ) -> Result<Vec<(f32, Vec<f32>)>, GpuError> {
+        self.backward_many_timed(scenes, p, targets).map(|(r, _)| r)
+    }
+
+    /// As [`Self::backward_many`], but also reports where the time went.
+    pub fn backward_many_timed(
+        &self,
+        scenes: &[Scene],
+        p: RenderParams,
+        targets: &[Canvas],
+    ) -> Result<(Vec<(f32, Vec<f32>)>, BackwardTimings), GpuError> {
+        let mut t = BackwardTimings::default();
+        let mut clock = std::time::Instant::now();
+        let mut lap = |t: &mut f32| {
+            *t = clock.elapsed().as_secs_f32() * 1e3;
+            clock = std::time::Instant::now();
+        };
+
         if scenes.len() != targets.len() {
             return Err(GpuError::TooLarge(format!(
                 "batch mismatch: {} scenes but {} targets",
@@ -468,7 +513,7 @@ impl GpuRasterizer {
             )));
         }
         let Some(n_tris) = self.check_batch(scenes)? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), t));
         };
 
         let batch = scenes.len();
@@ -476,6 +521,8 @@ impl GpuRasterizer {
         let image_bytes = (batch * pixels * 3 * 4) as u64;
 
         let packed = self.pack_batch(scenes, p, n_tris);
+        lap(&mut t.pack_ms);
+
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
@@ -496,6 +543,7 @@ impl GpuRasterizer {
             contents: bytemuck::cast_slice(&vec![0.0f32; grad_len]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
+        lap(&mut t.alloc_ms);
 
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("backward_batch"),
@@ -531,18 +579,35 @@ impl GpuRasterizer {
         // reduced on the host. Reducing it on the GPU would remove this last
         // per-pixel transfer entirely — the next thing worth doing here.
         let grads = self.read_buffer(&mut encoder, &grad_buf, (grad_len * 4) as u64)?;
-        let images = self.read_buffer(&mut encoder, &image_buf, image_bytes)?;
+        lap(&mut t.dispatch_ms);
 
+        let images = self.read_buffer(&mut encoder, &image_buf, image_bytes)?;
+        lap(&mut t.readback_ms);
+
+        // Reduced in parallel and without copying. The previous version cloned
+        // each item into a `Canvas` purely to call `mse` on it, allocating the
+        // whole batch a second time on the host for no reason.
         let stride = n_tris * Triangle::N_PARAMS;
-        Ok(images
-            .chunks_exact(pixels * 3)
-            .zip(targets)
-            .zip(grads.chunks_exact(stride))
+        let scale = 1.0 / (pixels * 3) as f64;
+        let out: Vec<(f32, Vec<f32>)> = images
+            .par_chunks_exact(pixels * 3)
+            .zip(targets.par_iter())
+            .zip(grads.par_chunks_exact(stride))
             .map(|((rendered, target), g)| {
-                let canvas = Canvas { width: p.width, height: p.height, data: rendered.to_vec() };
-                (canvas.mse(target), g.to_vec())
+                let sum: f64 = rendered
+                    .iter()
+                    .zip(&target.data)
+                    .map(|(a, b)| {
+                        let d = (a - b) as f64;
+                        d * d
+                    })
+                    .sum();
+                ((sum * scale) as f32, g.to_vec())
             })
-            .collect())
+            .collect();
+        lap(&mut t.loss_ms);
+
+        Ok((out, t))
     }
 
     /// Validates a batch and returns its shared triangle count.
