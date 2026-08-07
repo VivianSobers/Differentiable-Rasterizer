@@ -11,7 +11,7 @@ use diffrast::grad::{
 };
 use diffrast::raster::{render as cpu_render, RenderParams};
 use diffrast::{Canvas, Scene};
-use diffrast_gpu::{BackwardMode, GpuRasterizer};
+use diffrast_gpu::{BackwardMode, GpuRasterizer, ReduceMode};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -173,6 +173,38 @@ fn main() {
                 gpu_time * 1e3,
                 ratio,
                 if ratio > 1.0 { "GPU" } else { "cpu" }
+            );
+        }
+    }
+
+    // The fix for the measured bottleneck. Contention on the gradient
+    // accumulators scales with the number of contending threads, so the win
+    // should be largest where pixels are many and triangles (hence accumulator
+    // slots) are few.
+    println!("\n=== gradient reduction: global atomics vs workgroup reduction (batch of 16) ===");
+    println!("{:<30} {:>12} {:>13} {:>10}", "per-item work", "direct", "workgroup", "speedup");
+    for &size in &[64usize, 128, 256] {
+        for &tris in &[32usize, 128, 512] {
+            let batch = 16;
+            let p = RenderParams::new(size, size, 0.01);
+            let scenes: Vec<Scene> = (0..batch).map(|_| scene_of(tris)).collect();
+            let targets: Vec<Canvas> =
+                (0..batch).map(|_| Canvas::filled(size, size, [0.4, 0.5, 0.6])).collect();
+
+            let direct = time(2, || {
+                gpu.backward_many_full(&scenes, p, &targets, ReduceMode::Direct).expect("direct")
+            });
+            let reduced = time(2, || {
+                gpu.backward_many_full(&scenes, p, &targets, ReduceMode::Workgroup)
+                    .expect("workgroup")
+            });
+
+            println!(
+                "{:<30} {:>11.2}ms {:>12.2}ms {:>9.2}x",
+                format!("{size}x{size}, {tris} tris"),
+                direct * 1e3,
+                reduced * 1e3,
+                direct / reduced
             );
         }
     }
