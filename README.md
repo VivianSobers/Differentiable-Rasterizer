@@ -203,10 +203,43 @@ triangles is real, and so is the CPU's 2x win at 128px with 64 triangles; they
 are different regimes, not a contradiction.
 
 The consequence for training: **routing the PyTorch layer to the GPU
-unconditionally would be a regression** for typical configurations (64-128px,
-modest triangle counts). `gpu_bench` now ends with a crossover table sweeping
-resolution against triangle count so the dispatch rule can be read off measured
-data rather than assumed.
+unconditionally would be a regression** for typical configurations. `gpu_bench`
+ends with a crossover table so the dispatch rule is read off measured data.
+
+### The crossover, and what it exposed
+
+Batch of 16 on an idle 4090 vs 26 CPU cores — `gpu/cpu` above 1.0 means the GPU
+wins:
+
+| | 32 triangles | 128 triangles | 512 triangles |
+| --- | --- | --- | --- |
+| **64x64** | 0.42x | **1.17x** | **1.95x** |
+| **128x128** | 0.34x | **1.17x** | **1.91x** |
+| **256x256** | 0.12x | 0.49x | **1.17x** |
+
+More triangles help the GPU, as expected. More *pixels* hurt it, which is
+backwards — more pixels is more parallelism. Pulling on that:
+
+| GPU cost for 4x the work | via pixels | via triangles |
+| --- | --- | --- |
+| 32 triangles | **10.5x** | — |
+| 128 -> 512 triangles | — | 1.9x |
+
+Scaling superlinearly in pixels and sublinearly in triangles is not how compute
+behaves; it is how *transfers* behave. The cause was in this repo, not the
+hardware: `backward_many` rendered by calling `render_many`, which copied the
+batch to the host — and then immediately uploaded it straight back as an input
+to the backward pass. 12.6 MB round-tripped per call at 256px, for data that
+never needed to leave the device.
+
+The rendered batch now stays in GPU memory between the two dispatches. Images
+are still read back once, because the loss is reduced on the host; moving that
+reduction onto the GPU would remove the last per-pixel transfer, and is the next
+thing worth doing.
+
+The general lesson is why the crossover table exists at all: the profile said
+"the GPU is slow at high resolution", and the true statement was "this code
+copies every pixel across PCIe twice".
 
 ### How batching is implemented
 
