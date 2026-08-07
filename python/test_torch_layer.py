@@ -121,6 +121,26 @@ class TestRasterize(unittest.TestCase):
         self.assertTrue(torch.isfinite(net.weight.grad).all())
         self.assertGreater(net.weight.grad.abs().sum(), 0)
 
+    def test_rasterize_routes_to_the_requested_device(self) -> None:
+        gen = torch.Generator().manual_seed(0)
+        p = random_params(8, 128, generator=gen).requires_grad_(True)
+
+        rasterize(p, 64, 64, sigma=0.02, device="cpu").sum().backward()
+        self.assertEqual(last_device(), "cpu")
+
+        if gpu_adapter() is not None:
+            p2 = random_params(8, 128, generator=torch.Generator().manual_seed(0))
+            p2.requires_grad_(True)
+            # Both the forward and the backward must route; the backward is the
+            # one that matters for training and takes a different code path.
+            out = rasterize(p2, 64, 64, sigma=0.02, device="gpu")
+            self.assertEqual(last_device(), "gpu")
+            out.sum().backward()
+            self.assertEqual(last_device(), "gpu")
+
+            rel = (p.grad - p2.grad).abs().max() / p.grad.norm().clamp_min(1e-12)
+            self.assertLess(rel.item(), 1e-2, f"cpu/gpu gradient gap {rel.item():.2e}")
+
     def test_rejects_bad_shapes_and_sigma(self) -> None:
         p = random_params(1, 4, generator=torch.Generator().manual_seed(0))
         with self.assertRaises(ValueError):
