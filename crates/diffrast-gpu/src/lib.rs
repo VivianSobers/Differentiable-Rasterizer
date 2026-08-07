@@ -68,6 +68,9 @@ impl std::fmt::Display for GpuError {
 
 impl std::error::Error for GpuError {}
 
+/// Per-item `(loss, gradients)`, one entry per scene in a batch.
+pub type BatchGradients = Vec<(f32, Vec<f32>)>;
+
 /// Where the time went inside one [`GpuRasterizer::backward_many`] call.
 ///
 /// Added after two wrong guesses about the bottleneck. Extrapolating the
@@ -487,7 +490,7 @@ impl GpuRasterizer {
         scenes: &[Scene],
         p: RenderParams,
         targets: &[Canvas],
-    ) -> Result<Vec<(f32, Vec<f32>)>, GpuError> {
+    ) -> Result<BatchGradients, GpuError> {
         self.backward_many_timed(scenes, p, targets).map(|(r, _)| r)
     }
 
@@ -497,7 +500,7 @@ impl GpuRasterizer {
         scenes: &[Scene],
         p: RenderParams,
         targets: &[Canvas],
-    ) -> Result<(Vec<(f32, Vec<f32>)>, BackwardTimings), GpuError> {
+    ) -> Result<(BatchGradients, BackwardTimings), GpuError> {
         let mut t = BackwardTimings::default();
         let mut clock = std::time::Instant::now();
         let mut lap = |t: &mut f32| {
@@ -589,7 +592,7 @@ impl GpuRasterizer {
         // whole batch a second time on the host for no reason.
         let stride = n_tris * Triangle::N_PARAMS;
         let scale = 1.0 / (pixels * 3) as f64;
-        let out: Vec<(f32, Vec<f32>)> = images
+        let out: BatchGradients = images
             .par_chunks_exact(pixels * 3)
             .zip(targets.par_iter())
             .zip(grads.par_chunks_exact(stride))
