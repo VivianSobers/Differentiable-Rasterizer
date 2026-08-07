@@ -177,6 +177,44 @@ fn main() {
         }
     }
 
+    // Where the time actually goes. Extrapolating the crossover table to zero
+    // triangles left a large per-batch cost that geometry could not explain;
+    // this breaks that cost into phases rather than inferring it.
+    println!("\n=== phase breakdown of backward_many (batch of 16, 32 triangles) ===");
+    println!(
+        "{:<12} {:>9} {:>9} {:>11} {:>10} {:>9} {:>10}",
+        "resolution", "pack", "alloc", "dispatch", "readback", "loss", "total"
+    );
+    for &size in &[64usize, 128, 256] {
+        let batch = 16;
+        let tris = 32;
+        let p = RenderParams::new(size, size, 0.01);
+        let scenes: Vec<Scene> = (0..batch).map(|_| scene_of(tris)).collect();
+        let targets: Vec<Canvas> =
+            (0..batch).map(|_| Canvas::filled(size, size, [0.4, 0.5, 0.6])).collect();
+
+        // Warm up, then report the median of a few runs.
+        for _ in 0..2 {
+            gpu.backward_many_timed(&scenes, p, &targets).expect("timed");
+        }
+        let mut runs: Vec<_> = (0..5)
+            .map(|_| gpu.backward_many_timed(&scenes, p, &targets).expect("timed").1)
+            .collect();
+        runs.sort_by(|a, b| a.total_ms().partial_cmp(&b.total_ms()).unwrap());
+        let t = runs[runs.len() / 2];
+
+        println!(
+            "{:<12} {:>8.2}ms {:>8.2}ms {:>10.2}ms {:>9.2}ms {:>8.2}ms {:>9.2}ms",
+            format!("{size}x{size}"),
+            t.pack_ms,
+            t.alloc_ms,
+            t.dispatch_ms,
+            t.readback_ms,
+            t.loss_ms,
+            t.total_ms()
+        );
+    }
+
     println!(
         "\nnote: timings include buffer upload and readback, so short renders are\n\
          dominated by transfer rather than compute. \"batch win\" isolates that:\n\
