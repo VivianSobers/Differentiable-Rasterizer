@@ -20,6 +20,8 @@ try:
         N_PARAMS,
         clamp_params,
         fused_loss,
+        gpu_adapter,
+        last_device,
         psnr,
         random_params,
         rasterize,
@@ -153,6 +155,51 @@ class TestFusedLoss(unittest.TestCase):
 
         torch.testing.assert_close(losses, per_item.detach(), rtol=1e-4, atol=1e-6)
         torch.testing.assert_close(grads, pg.grad, rtol=1e-3, atol=1e-7)
+
+    def test_device_routing_is_honoured(self) -> None:
+        """Assert on the device actually used, not on whether it got faster.
+
+        An earlier version of the binding parsed `device` and then ignored it,
+        routing everything to the CPU. Timings still looked plausible and the
+        gradients still matched, because they were the *same* CPU gradients —
+        only `last_device()` exposed it.
+        """
+        gen = torch.Generator().manual_seed(0)
+        p = random_params(8, 128, generator=gen)
+        targets = torch.rand(8, 64, 64, 3, generator=torch.Generator().manual_seed(1))
+
+        fused_loss(p, targets, sigma=0.02, device="cpu")
+        self.assertEqual(last_device(), "cpu")
+
+        if gpu_adapter() is not None:
+            fused_loss(p, targets, sigma=0.02, device="gpu")
+            self.assertEqual(last_device(), "gpu")
+
+    def test_gpu_and_cpu_gradients_agree(self) -> None:
+        if gpu_adapter() is None:
+            self.skipTest("no GPU adapter")
+
+        gen = torch.Generator().manual_seed(2)
+        p = random_params(8, 128, generator=gen)
+        targets = torch.rand(8, 64, 64, 3, generator=torch.Generator().manual_seed(3))
+
+        cpu_loss, cpu_grads = fused_loss(p, targets, sigma=0.02, device="cpu")
+        gpu_loss, gpu_grads = fused_loss(p, targets, sigma=0.02, device="gpu")
+
+        torch.testing.assert_close(cpu_loss, gpu_loss, rtol=1e-4, atol=1e-7)
+        rel = (cpu_grads - gpu_grads).abs().max() / cpu_grads.norm().clamp_min(1e-12)
+        self.assertLess(rel.item(), 1e-3, f"relative gradient difference {rel.item():.2e}")
+        # Bit-identical would mean one path silently ran the other's code.
+        self.assertFalse(
+            torch.equal(cpu_grads, gpu_grads),
+            "identical to the last bit — the GPU path probably did not run",
+        )
+
+    def test_unknown_device_is_rejected(self) -> None:
+        gen = torch.Generator().manual_seed(0)
+        p = random_params(2, 8, generator=gen)
+        with self.assertRaises(ValueError):
+            fused_loss(p, torch.rand(2, 16, 16, 3), device="banana")
 
     def test_rejects_bad_target_shape(self) -> None:
         p = random_params(1, 4, generator=torch.Generator().manual_seed(0))
