@@ -12,6 +12,9 @@
 //! cull exactly — see `common.wgsl` for why that matters.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::Mutex;
 
 use bytemuck::{Pod, Zeroable};
 use diffrast::canvas::Canvas;
@@ -118,6 +121,73 @@ struct PackedBatch {
     backgrounds: wgpu::Buffer,
 }
 
+/// How many buffers the pool will hold on to, in bytes.
+///
+/// Generous, because the buffers worth pooling are the large ones and a
+/// training run reuses the same few sizes forever. Past the cap, released
+/// buffers are dropped rather than kept, so a caller that sweeps through many
+/// distinct sizes degrades to plain allocation instead of growing without
+/// bound.
+const POOL_BYTE_LIMIT: u64 = 512 << 20;
+
+/// Reusable device buffers, keyed by `(usage, size)`.
+///
+/// Allocation became the largest phase of a batched backward call once atomic
+/// contention was fixed — 5.85 ms of 13.04 ms at 256px, against 1.95 ms of
+/// actual dispatch. Training calls this thousands of times at *identical*
+/// shapes, so every allocation after the first is avoidable.
+///
+/// Sizes must match exactly to be reused. Bucketing by rounding up would raise
+/// the hit rate for callers that vary their shapes, but training does not vary
+/// them, and exact matching keeps the mapping between a binding's length and
+/// its contents obvious.
+#[derive(Default)]
+struct BufferPool {
+    free: HashMap<(u32, u64), Vec<wgpu::Buffer>>,
+    bytes: u64,
+    hits: u64,
+    misses: u64,
+}
+
+/// Pool counters, exposed so reuse can be *asserted* rather than inferred from
+/// a timing. A pool that silently never hits looks exactly like a slow GPU.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub bytes: u64,
+}
+
+/// A buffer borrowed from the pool, returned when it goes out of scope.
+///
+/// Every call site reads its results back before returning, which blocks until
+/// the queue drains, so a buffer is always idle by the time it is released.
+struct Pooled<'a> {
+    buffer: Option<wgpu::Buffer>,
+    pool: &'a Mutex<BufferPool>,
+    key: (u32, u64),
+}
+
+impl Deref for Pooled<'_> {
+    type Target = wgpu::Buffer;
+
+    fn deref(&self) -> &wgpu::Buffer {
+        self.buffer.as_ref().expect("buffer is taken only on drop")
+    }
+}
+
+impl Drop for Pooled<'_> {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else { return };
+        let Ok(mut pool) = self.pool.lock() else { return };
+        if pool.bytes + self.key.1 > POOL_BYTE_LIMIT {
+            return;
+        }
+        pool.bytes += self.key.1;
+        pool.free.entry(self.key).or_default().push(buffer);
+    }
+}
+
 /// A GPU device with the rasterizer pipelines compiled and ready.
 ///
 /// Creating this is expensive — it initializes a device and compiles shaders —
@@ -131,6 +201,7 @@ pub struct GpuRasterizer {
     forward_batch: wgpu::ComputePipeline,
     backward_batch: wgpu::ComputePipeline,
     backward_batch_reduced: wgpu::ComputePipeline,
+    pool: Mutex<BufferPool>,
     info: String,
 }
 
@@ -234,8 +305,46 @@ impl GpuRasterizer {
             forward_batch,
             backward_batch,
             backward_batch_reduced,
+            pool: Mutex::new(BufferPool::default()),
             info,
         })
+    }
+
+    /// Take a buffer of exactly this size and usage from the pool, allocating
+    /// one only if none is free. The contents are whatever the last user left,
+    /// so callers must overwrite or clear it.
+    fn pooled(&self, label: &'static str, usage: wgpu::BufferUsages, size: u64) -> Pooled<'_> {
+        let key = (usage.bits(), size);
+        let mut pool = self.pool.lock().expect("pool mutex poisoned");
+
+        if let Some(buffer) = pool.free.get_mut(&key).and_then(Vec::pop) {
+            pool.bytes -= size;
+            pool.hits += 1;
+            return Pooled { buffer: Some(buffer), pool: &self.pool, key };
+        }
+
+        pool.misses += 1;
+        drop(pool);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        });
+        Pooled { buffer: Some(buffer), pool: &self.pool, key }
+    }
+
+    /// Reuse counters for the buffer pool.
+    pub fn pool_stats(&self) -> PoolStats {
+        let pool = self.pool.lock().expect("pool mutex poisoned");
+        PoolStats { hits: pool.hits, misses: pool.misses, bytes: pool.bytes }
+    }
+
+    /// Drop every pooled buffer, returning the memory to the driver.
+    pub fn clear_pool(&self) {
+        let mut pool = self.pool.lock().expect("pool mutex poisoned");
+        pool.free.clear();
+        pool.bytes = 0;
     }
 
     fn pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ComputePipeline {
@@ -494,7 +603,8 @@ impl GpuRasterizer {
         let packed = self.pack_batch(scenes, p, n_tris);
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let image_buf = self.encode_forward(&mut encoder, &packed, p, batch);
+        let image_buf = self.image_buffer(p, batch);
+        self.encode_forward(&mut encoder, &packed, p, batch, &image_buf);
 
         let data = self.read_buffer(&mut encoder, &image_buf, (batch * pixels * 3 * 4) as u64)?;
         Ok(data
@@ -556,6 +666,17 @@ impl GpuRasterizer {
         let pixels = p.width * p.height;
         let image_bytes = (batch * pixels * 3 * 4) as u64;
 
+        // Checked rather than assumed: the target buffer is now sized from the
+        // render parameters, so a target of the wrong size would write past its
+        // end. Previously it produced a mis-sized binding and quietly wrong
+        // gradients, which is worse.
+        if let Some(bad) = targets.iter().position(|c| c.width != p.width || c.height != p.height) {
+            return Err(GpuError::TooLarge(format!(
+                "target {bad} is {}x{}, but the render is {}x{}",
+                targets[bad].width, targets[bad].height, p.width, p.height
+            )));
+        }
+
         let packed = self.pack_batch(scenes, p, n_tris);
         lap(&mut t.pack_ms);
 
@@ -568,17 +689,24 @@ impl GpuRasterizer {
         // round-tripped per call at 256px, which showed up as GPU cost scaling
         // *superlinearly* with pixel count while scaling sublinearly with
         // triangle count. Compute does not behave that way; transfers do.
-        let image_buf = self.encode_forward(&mut encoder, &packed, p, batch);
+        let image_buf = self.image_buffer(p, batch);
+        self.encode_forward(&mut encoder, &packed, p, batch, &image_buf);
 
-        let flat_targets: Vec<f32> = targets.iter().flat_map(|c| c.data.iter().copied()).collect();
-        let target_buf = self.storage("targets", &flat_targets);
+        // Written per canvas rather than through a concatenated `Vec`, which
+        // was a second host-side copy of the whole batch — 12.6 MB at 256px,
+        // allocated and memcpy'd once per call for no reason.
+        let target_buf = self.pooled(
+            "targets",
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            image_bytes,
+        );
+        for (i, target) in targets.iter().enumerate() {
+            let offset = (i * pixels * 3 * 4) as u64;
+            self.queue.write_buffer(&target_buf, offset, bytemuck::cast_slice(&target.data));
+        }
 
         let grad_len = batch * n_tris * Triangle::N_PARAMS;
-        let grad_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("grads"),
-            contents: bytemuck::cast_slice(&vec![0.0f32; grad_len]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
+        let grad_buf = self.gradient_buffer(grad_len, &mut encoder);
         lap(&mut t.alloc_ms);
 
         let pipeline = match reduce {
@@ -683,15 +811,18 @@ impl GpuRasterizer {
         let packed = self.pack_batch_with(scenes, p, n_tris, true);
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let image_buf = self.encode_forward(&mut encoder, &packed, p, batch);
+        let image_buf = self.image_buffer(p, batch);
+        self.encode_forward(&mut encoder, &packed, p, batch, &image_buf);
 
-        let grad_in_buf = self.storage("grad_in", grad_images);
+        let grad_in_buf = self.pooled(
+            "grad_in",
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            std::mem::size_of_val(grad_images) as u64,
+        );
+        self.queue.write_buffer(&grad_in_buf, 0, bytemuck::cast_slice(grad_images));
+
         let grad_len = batch * n_tris * Triangle::N_PARAMS;
-        let grad_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("grads"),
-            contents: bytemuck::cast_slice(&vec![0.0f32; grad_len]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
+        let grad_buf = self.gradient_buffer(grad_len, &mut encoder);
 
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("backward_batch_grad"),
@@ -772,22 +903,46 @@ impl GpuRasterizer {
         }
     }
 
-    /// Record the batched forward pass and return the buffer it writes into.
-    /// The buffer stays on the device; nothing is read back here.
+    /// Take a pooled buffer sized for one batch of rendered images.
+    ///
+    /// The forward shader writes every pixel it is dispatched for, so a reused
+    /// buffer needs no clearing — which is the point of pooling it.
+    fn image_buffer(&self, p: RenderParams, batch: usize) -> Pooled<'_> {
+        self.pooled(
+            "images",
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            (batch * p.width * p.height * 3 * 4) as u64,
+        )
+    }
+
+    /// Take a pooled gradient accumulator and record a clear for it.
+    ///
+    /// Unlike the image buffer this one is accumulated into, not overwritten,
+    /// so a reused buffer must be zeroed. `clear_buffer` does it on the device;
+    /// uploading a zero-filled `Vec` (what allocating it fresh amounted to)
+    /// would put the cost straight back.
+    fn gradient_buffer(&self, len: usize, encoder: &mut wgpu::CommandEncoder) -> Pooled<'_> {
+        let buffer = self.pooled(
+            "grads",
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            (len * 4) as u64,
+        );
+        encoder.clear_buffer(&buffer, 0, None);
+        buffer
+    }
+
+    /// Record the batched forward pass into `image_buf`. Nothing is read back
+    /// here; the buffer stays on the device for the backward pass to consume.
     fn encode_forward(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         packed: &PackedBatch,
         p: RenderParams,
         batch: usize,
-    ) -> wgpu::Buffer {
-        let image_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("images"),
-            size: (batch * p.width * p.height * 3 * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
+        image_buf: &wgpu::Buffer,
+    ) {
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("forward_batch"),
             layout: &self.forward_batch.get_bind_group_layout(0),
@@ -813,9 +968,6 @@ impl GpuRasterizer {
             p.height.div_ceil(8) as u32,
             batch as u32,
         );
-        drop(pass);
-
-        image_buf
     }
 
     fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {
@@ -841,12 +993,11 @@ impl GpuRasterizer {
         source: &wgpu::Buffer,
         size: u64,
     ) -> Result<Vec<f32>, GpuError> {
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging"),
+        let staging = self.pooled(
+            "staging",
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        );
 
         let mut encoder = std::mem::replace(
             encoder,
@@ -1118,6 +1269,55 @@ mod tests {
         let p = RenderParams::new(16, 16, 0.02);
         assert!(gpu.render_many(&[], p).expect("empty").is_empty());
         assert!(gpu.backward_many(&[], p, &[]).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn mismatched_target_sizes_are_rejected() {
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(16, 16, 0.02);
+        let scenes = vec![test_scene(4)];
+        let targets = vec![Canvas::filled(16, 12, [0.5, 0.5, 0.5])];
+        assert!(gpu.backward_many(&scenes, p, &targets).is_err());
+    }
+
+    #[test]
+    fn buffers_are_reused_across_identical_calls() {
+        // This one builds its own device, unlike every other test here. Pool
+        // counters are per-device state and the shared device is in use by
+        // tests running concurrently, so exact assertions need isolation.
+        let Ok(gpu) = GpuRasterizer::new() else { return };
+        let p = RenderParams::new(32, 32, 0.02);
+        let scenes: Vec<Scene> = (0..2).map(|_| test_scene(6)).collect();
+        let targets: Vec<Canvas> =
+            (0..2).map(|_| Canvas::filled(32, 32, [0.3, 0.4, 0.5])).collect();
+
+        let first = gpu.backward_many(&scenes, p, &targets).expect("first call");
+        let after_first = gpu.pool_stats();
+        assert!(after_first.misses > 0, "the first call must allocate something");
+
+        let second = gpu.backward_many(&scenes, p, &targets).expect("second call");
+        let after_second = gpu.pool_stats();
+
+        // The whole claim: a repeat of the same shape allocates nothing. A
+        // pool that silently never hit would be invisible in a timing.
+        assert_eq!(
+            after_second.misses,
+            after_first.misses,
+            "identical second call allocated {} new buffers",
+            after_second.misses - after_first.misses
+        );
+        assert!(after_second.hits > after_first.hits, "no buffer was reused");
+
+        // Reuse must not leak state between calls — the gradient accumulator
+        // is the one that is added into rather than overwritten, so a missing
+        // clear would double it here.
+        for (a, b) in first.iter().zip(&second) {
+            assert!((a.0 - b.0).abs() < 1e-9, "loss changed on reuse: {} vs {}", a.0, b.0);
+            assert_eq!(a.1, b.1, "gradients changed when buffers were reused");
+        }
+
+        gpu.clear_pool();
+        assert_eq!(gpu.pool_stats().bytes, 0);
     }
 
     #[test]
