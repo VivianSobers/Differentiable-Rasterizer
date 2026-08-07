@@ -136,10 +136,17 @@ render comparisons while B keeps training.
 Three things, in order of usefulness:
 
 1. `docs/gpu-report.txt` from `scripts/collect-gpu-report.sh`. Two sections
-   matter now: `gradient reduction` shows what the workgroup reduction bought,
-   and `crossover` decides where `--raster-device auto` should switch over. The
-   crossover figures currently in the README predate the reduction and
-   understate the GPU.
+   matter now:
+   - `phase breakdown` — the last run showed 78% of a backward call at 256px
+     was allocation and readback rather than compute. Buffer pooling and a
+     device-side loss reduction have since landed, and the prediction is that
+     `alloc` and `readback` both drop by roughly 3x. That prediction has only
+     been checked on an integrated card, which is the wrong shape of hardware
+     to check it on.
+   - `crossover` — decides where `--raster-device auto` switches over. If the
+     `32 tris` column has flipped to `GPU`, the thresholds in `prefer_gpu`
+     should come down; `test_policy_matches_the_measured_crossover` encodes the
+     current table and will need its numbers updated with it.
 2. `runs/*/history.json` — shows whether the amortized model is actually
    learning or just memorizing the warm start.
 3. Peak GPU memory during training (`nvidia-smi` during a run) — tells us how
