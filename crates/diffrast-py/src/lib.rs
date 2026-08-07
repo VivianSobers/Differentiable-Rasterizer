@@ -87,20 +87,29 @@ fn resolve_device(device: Device, batch: usize, tris: usize, pixels: usize) -> P
 }
 
 /// Should this workload go to the GPU?
-///
-/// The rule comes from the measured crossover rather than a preference for the
-/// GPU. Contention on the gradient accumulators means the GPU only pulls ahead
-/// once there is enough geometry to spread across; below that a many-core CPU
-/// parallelizing over batch items wins outright. The threshold is deliberately
-/// conservative — being wrong costs a factor of two, and the CPU path is never
-/// catastrophic.
 fn prefer_gpu(batch: usize, tris: usize, pixels: usize) -> bool {
-    if gpu().is_none() {
-        return false;
-    }
-    // Below ~64 triangles the accumulators are too few to spread contention,
-    // and small batches cannot amortize the dispatch.
-    tris >= 64 && batch >= 4 && batch * tris * pixels >= 4_000_000
+    gpu().is_some() && gpu_is_worth_it(batch, tris, pixels)
+}
+
+/// The dispatch policy on its own, so it can be tested against the measured
+/// crossover without needing an adapter present.
+///
+/// The rule is read off `gpu_bench`'s crossover table rather than off a
+/// preference for the GPU, and **triangle count is the axis that separates the
+/// two regimes**. At 32 triangles the CPU wins or ties at every resolution
+/// measured; at 128 the GPU wins by 2.0-3.6x at every resolution. 64 sits
+/// between them and is the value measured directly by the batch sweep, where
+/// the GPU wins at batch 8 and 64 and ties at 32 — never loses.
+///
+/// The total-work floor is a floor, not a discriminator. An earlier version
+/// used `batch * tris * pixels >= 4e6` as though it predicted the winner; the
+/// current table shows it does not — 8.4M is a 2.04x GPU win in one cell and a
+/// tie in another, and 33.5M is a CPU win. That threshold was calibrated when
+/// resolution genuinely hurt the GPU, which the workgroup reduction fixed.
+/// What remains true is that a few hundred microseconds of fixed overhead
+/// cannot be amortized by a trivially small workload, so a low floor stays.
+fn gpu_is_worth_it(batch: usize, tris: usize, pixels: usize) -> bool {
+    tris >= 64 && batch >= 4 && batch * tris * pixels >= 1_000_000
 }
 
 /// Rebuild a scene from one row of the parameter tensor.
@@ -387,6 +396,17 @@ fn params_per_triangle() -> usize {
     N_PARAMS
 }
 
+/// What `device="auto"` decides for a workload of this shape.
+///
+/// This is the size rule alone — `auto` additionally requires an adapter, so a
+/// `True` here does not guarantee the GPU was used. Exposed mostly so the
+/// policy can be tested against the measured crossover on machines without a
+/// GPU; `last_device()` is what reports the decision actually taken.
+#[pyfunction]
+fn policy_prefers_gpu(batch: usize, tris: usize, pixels: usize) -> bool {
+    gpu_is_worth_it(batch, tris, pixels)
+}
+
 #[pymodule]
 fn diffrast_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render_batch, m)?)?;
@@ -395,6 +415,7 @@ fn diffrast_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(params_per_triangle, m)?)?;
     m.add_function(wrap_pyfunction!(gpu_adapter, m)?)?;
     m.add_function(wrap_pyfunction!(last_device, m)?)?;
+    m.add_function(wrap_pyfunction!(policy_prefers_gpu, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
