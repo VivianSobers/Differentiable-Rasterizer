@@ -36,17 +36,18 @@ class _Rasterize(torch.autograd.Function):
     """Bridges Rust's gradients into PyTorch's autograd graph."""
 
     @staticmethod
-    def forward(ctx, params: Tensor, height: int, width: int, sigma: float, background):
-        # The extension is CPU/float32 only; moving here rather than raising
-        # keeps a GPU training loop working without special-casing at every
-        # call site. The tensors coming back are re-attached to the caller's
-        # device in `rasterize`.
+    def forward(ctx, params: Tensor, height: int, width: int, sigma: float, background, device):
+        # Tensors always cross the boundary as CPU float32 — the extension owns
+        # its own GPU context (wgpu), which is separate from torch's CUDA
+        # context. `device` selects which backend the *extension* uses, not
+        # where the torch tensors live.
         params_np = params.detach().to("cpu", torch.float32).contiguous().numpy()
-        images = diffrast_rs.render_batch(params_np, height, width, sigma, background)
+        images = diffrast_rs.render_batch(params_np, height, width, sigma, background, device)
 
         ctx.save_for_backward(params)
         ctx.sigma = sigma
         ctx.background = background
+        ctx.device = device
         return torch.from_numpy(images)
 
     @staticmethod
@@ -55,10 +56,12 @@ class _Rasterize(torch.autograd.Function):
         params_np = params.detach().to("cpu", torch.float32).contiguous().numpy()
         grad_np = grad_images.detach().to("cpu", torch.float32).contiguous().numpy()
 
-        grads = diffrast_rs.backward_batch(params_np, grad_np, ctx.sigma, ctx.background)
+        grads = diffrast_rs.backward_batch(
+            params_np, grad_np, ctx.sigma, ctx.background, ctx.device
+        )
         grad_params = torch.from_numpy(grads).to(params.device, params.dtype)
-        # One gradient per forward input; the other four are non-tensors.
-        return grad_params, None, None, None, None
+        # One gradient per forward input; the other five are non-tensors.
+        return grad_params, None, None, None, None, None
 
 
 def rasterize(
@@ -68,6 +71,7 @@ def rasterize(
     sigma: float = 0.0015,
     background: tuple[float, float, float] = (0.0, 0.0, 0.0),
     channels_first: bool = True,
+    device: str = "auto",
 ) -> Tensor:
     """Render a batch of triangle scenes, differentiably.
 
@@ -81,6 +85,9 @@ def rasterize(
         background: color the canvas is cleared to.
         channels_first: return `(B, 3, H, W)` for torch, rather than the
             `(B, H, W, 3)` the renderer produces natively.
+        device: which backend the rasterizer uses — `"cpu"`, `"gpu"` or
+            `"auto"`. Independent of where the torch tensors live: the
+            extension has its own wgpu context.
 
     Returns:
         The rendered batch, in linear light.
@@ -94,7 +101,7 @@ def rasterize(
     if not (sigma > 0):
         raise ValueError("sigma must be positive")
 
-    images = _Rasterize.apply(params, height, width, sigma, background)
+    images = _Rasterize.apply(params, height, width, sigma, background, device)
     images = images.to(params.device, params.dtype)
     return images.permute(0, 3, 1, 2).contiguous() if channels_first else images
 
