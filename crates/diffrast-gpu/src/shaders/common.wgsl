@@ -14,9 +14,12 @@ struct Params {
     background: vec3<f32>,
     min_weight: f32,
     write_tape: u32,
-    // Three scalar u32s, not a vec3: a vec3 would align to 16 and push the
-    // struct to 64 bytes, silently disagreeing with the 48-byte Rust struct.
-    _pad0: u32,
+    // When set, the "target" buffer holds dL/d(pixel) directly rather than a
+    // target image. Training needs this: autograd hands the layer an upstream
+    // gradient, and synthesizing a target from it would mean rendering twice.
+    grad_input: u32,
+    // Two scalar u32s, not a vec2/vec3: a vector would align to 8 or 16 and
+    // change the struct size, silently disagreeing with the Rust definition.
     _pad1: u32,
     _pad2: u32,
 }
