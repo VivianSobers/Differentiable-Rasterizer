@@ -144,16 +144,16 @@ Measured on an **RTX 4090** against a 26-core i9-13900. (Reproduce with
 
 | Forward | CPU (26 cores) | RTX 4090 | Speedup |
 | --- | --- | --- | --- |
-| 128x128, 64 triangles | 0.52 ms | 0.10 ms | 5.2x |
-| 256x256, 128 triangles | 3.65 ms | 0.20 ms | 18.2x |
-| 512x512, 256 triangles | 25.8 ms | 0.70 ms | 36.8x |
-| 512x512, 1024 triangles | 96.7 ms | 1.36 ms | **71x** |
+| 128x128, 64 triangles | 0.51 ms | 0.14 ms | 3.7x |
+| 256x256, 128 triangles | 3.46 ms | 0.20 ms | 17.0x |
+| 512x512, 256 triangles | 25.6 ms | 0.76 ms | 33.8x |
+| 512x512, 1024 triangles | 96.4 ms | 1.36 ms | **71x** |
 
 | Forward + backward | CPU (26 cores) | RTX 4090 | Speedup |
 | --- | --- | --- | --- |
-| 128x128, 64 triangles | 2.81 ms | 2.18 ms | 1.3x |
-| 256x256, 128 triangles | 22.2 ms | 16.9 ms | 1.3x |
-| 256x256, 512 triangles | 85.8 ms | 18.3 ms | **4.7x** |
+| 128x128, 64 triangles | 2.81 ms | 2.13 ms | 1.3x |
+| 256x256, 128 triangles | 23.2 ms | 16.9 ms | 1.4x |
+| 256x256, 512 triangles | 87.8 ms | 20.4 ms | **4.3x** |
 
 The speedup keeps growing with load and has not saturated at 1024 triangles,
 which says the device is still being fed rather than waiting.
@@ -164,8 +164,8 @@ time and the GPU **1.08x**:
 
 | 256x256 | 128 triangles | 512 triangles | Cost of 4x geometry |
 | --- | --- | --- | --- |
-| CPU | 22.2 ms | 85.8 ms | 3.87x |
-| GPU | 16.9 ms | 18.3 ms | **1.08x** |
+| CPU | 23.2 ms | 87.8 ms | 3.79x |
+| GPU | 16.9 ms | 20.4 ms | **1.21x** |
 
 The GPU absorbs four times the geometry almost for free, because at these sizes
 the backward pass is bound by fixed overhead — buffer upload and readback — not
@@ -180,8 +180,8 @@ there are two implementations, and `Recompute` is the default:
 
 | Mode | Compute | Memory | 4090, 256px, 512 tris |
 | --- | --- | --- | --- |
-| `Taped` | O(T) | O(T x pixels) | 27.3 ms |
-| `Recompute` | O(T²) | none | **18.3 ms** |
+| `Taped` | O(T) | O(T x pixels) | 30.2 ms |
+| `Recompute` | O(T²) | none | **20.4 ms** |
 
 `Recompute` re-derives the canvas beneath each triangle rather than storing it,
 and wins despite doing quadratically more arithmetic — the bounding-box cull
@@ -193,32 +193,32 @@ choice like this can ask for. Both are kept, with a test asserting they agree.
 ### Batching, and where the GPU actually wins
 
 `render_many` and `backward_many` submit a whole batch as one dispatch, which
-removes the per-call overhead the profile pointed at. It works — **2.8-3.5x**
-over dispatching one at a time, on both 4090 boxes.
-
-It also does not do what I expected, which is the more useful result:
+removes the per-call overhead the profile pointed at. It works — **6-8x** over
+dispatching one at a time:
 
 | batch of 64, 128px, 64 tris | CPU rayon (26 cores) | GPU one-by-one | GPU batched |
 | --- | --- | --- | --- |
-| worker-2 | **21.5 ms** | 135.0 ms | 45.4 ms |
+| worker-2 | 21.2 ms | 131.0 ms | **16.2 ms** |
 
-Batching is 3x faster than not batching, and still **2x slower than the CPU**.
-At small per-item work the CPU parallelizes across batch items nearly perfectly
-— 26 cores on 64 independent images — while the GPU pays upload and readback for
-a workload too small to amortize them. The GPU's 4.7x win at 256px with 512
-triangles is real, and so is the CPU's 2x win at 128px with 64 triangles; they
-are different regimes, not a contradiction.
+This row is worth keeping the history of, because it inverted. Before the
+workgroup reduction the batched GPU took **45.4 ms** here — 3x better than
+one-by-one and still **2x worse than the CPU**. At small per-item work 26 cores
+parallelize across batch items nearly perfectly, while the GPU paid upload and
+readback for a workload too small to amortize them.
 
-The consequence for training: **routing the PyTorch layer to the GPU
-unconditionally would be a regression** for typical configurations. `gpu_bench`
-ends with a crossover table so the dispatch rule is read off measured data.
+That measurement is the reason the PyTorch layer was never routed to the GPU
+unconditionally, and it was the right call at the time. Fixing the contention
+(below) moved the line rather than erasing it: the GPU now takes this row by
+1.3x, but a CPU-wins region still exists at low triangle counts. `gpu_bench`
+ends with a crossover table so the dispatch rule stays read off measured data
+instead of off an assumption that aged badly once already.
 
 ### The crossover, and what it exposed
 
-> **These numbers predate the workgroup reduction below**, which made the GPU
-> backward 2-7x faster. They are kept because they are what located the
-> bottleneck; the `cpu` cells in particular should be re-measured before being
-> used to choose a device. `./scripts/collect-gpu-report.sh` regenerates them.
+> These are the **pre-reduction** numbers. They are kept because they are the
+> diagnostic — the shape of this table is what located the bottleneck. The
+> current crossover, which is what you should actually dispatch on, is
+> [further down](#the-crossover-after-the-fix).
 
 Batch of 16 on an idle 4090 vs 26 CPU cores — `gpu/cpu` above 1.0 means the GPU
 wins:
@@ -255,7 +255,9 @@ predicting that it would be was wrong. Which is what the phase breakdown is for.
 ### Where the time actually goes
 
 `backward_many_timed` reports each phase. On an idle 4090, batch of 16, 32
-triangles:
+triangles — again, this is the **pre-reduction** profile, and the
+[post-fix one](#what-is-left-now-that-it-is-not-the-atomics) looks nothing like
+it:
 
 | resolution | pack | alloc | dispatch | readback | loss | total |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -292,21 +294,27 @@ performs one global atomic per triangle per *workgroup* instead of one per
 pixel — up to 64x fewer global atomics at a 64-thread workgroup. It is the
 default.
 
-Speedup over the previous path, batch of 16:
+Speedup over the previous path, batch of 16, on an idle 4090:
 
 | | 32 triangles | 128 triangles | 512 triangles |
 | --- | --- | --- | --- |
-| **64x64** | 2.70x | 2.54x | 2.07x |
-| **128x128** | 4.47x | 3.24x | 2.83x |
-| **256x256** | **6.87x** | 4.17x | 3.07x |
+| **64x64** | 1.53x | 1.69x | 1.14x |
+| **128x128** | 2.26x | 2.89x | 1.85x |
+| **256x256** | **6.59x** | 5.19x | 3.31x |
 
 The *shape* of that table is the real result. Contention theory predicts the win
 grows with pixel count (more threads queuing) and shrinks with triangle count
-(more accumulator slots to spread across). Both hold, in both directions, across
-all nine cells.
+(more accumulator slots to spread across).
+
+The pixel axis holds cleanly — every column rises monotonically, by 4.3x, 3.1x
+and 2.9x from top to bottom. The triangle axis holds at 256px (6.59x → 3.31x)
+and is inside the noise on the two smaller canvases, where the whole call is
+under 8 ms and dominated by transfer. On an integrated AMD card, where every
+cell is compute-bound, both axes hold monotonically in all nine.
 
 And the anomaly that started this is gone. Dispatch scaling per 4x pixels was
-**12.6x**; it is now **~4.3x** — linear, which is what compute-bound looks like.
+**12.6x**; it is now **2.4-3.1x** — linear or better, which is what
+compute-bound looks like.
 
 Barrier uniformity was the whole difficulty. `workgroupBarrier` is undefined
 behaviour unless every thread reaches it, and the straightforward shader both
@@ -317,6 +325,49 @@ on `n_tris`, and each chunk's partials flushed before the next clears them.
 `workgroup_reduction_handles_non_multiple_sizes` covers the cases that would
 expose a mistake — a 37x19 canvas with 33 triangles, where edge threads are
 inactive and the last chunk is partial.
+
+### The crossover, after the fix
+
+Same measurement as [before](#the-crossover-and-what-it-exposed) — batch of 16,
+idle 4090 vs 26 CPU cores, `gpu/cpu` above 1.0 means the GPU wins:
+
+| | 32 triangles | 128 triangles | 512 triangles |
+| --- | --- | --- | --- |
+| **64x64** | 0.83x | **2.04x** | **2.37x** |
+| **128x128** | **1.02x** | **3.61x** | **3.52x** |
+| **256x256** | 0.79x | **2.41x** | **3.38x** |
+
+The pixel penalty is gone, which is the clearest confirmation that the diagnosis
+was right. At 512 triangles the GPU's margin used to *shrink* as resolution grew
+— 1.95x, 1.91x, 1.17x — and now holds flat at 2.37x, 3.52x, 3.38x. Resolution
+stopped being the thing that hurt.
+
+What survives is a real CPU-wins column at 32 triangles. That one is not
+contention.
+
+### What is left, now that it is not the atomics
+
+The same phase breakdown, re-run — batch of 16, 32 triangles:
+
+| resolution | pack | alloc | dispatch | readback | loss | total |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64x64 | 0.02 ms | 0.26 ms | 0.26 ms | 0.11 ms | 0.12 ms | 0.77 ms |
+| 128x128 | 0.02 ms | 0.99 ms | 0.63 ms | 0.36 ms | 0.22 ms | 2.22 ms |
+| 256x256 | 0.03 ms | **5.85 ms** | 1.95 ms | **4.34 ms** | 0.87 ms | 13.04 ms |
+
+Dispatch at 256px went from 73.43 ms to 1.95 ms — a **38x** drop — and the
+profile inverted with it. Dispatch was 86.6% of the call and is now 15%. Buffer
+allocation and readback, the "under 7%" that I explicitly dismissed as the wrong
+thing to optimize, are now **78%**.
+
+Both statements were true when measured. Removing a dominant cost promotes
+whatever was sitting behind it, so a profile is only ever a statement about the
+current bottleneck — not a ranking of what matters.
+
+It also explains the 32-triangle column exactly. At 256px the GPU's actual
+compute is 1.95 ms against the CPU's 11.90 ms — a 6x win it never gets to bank,
+because 11 ms of allocation and transfer sit on top of it. The CPU is not
+winning that cell on arithmetic; it is winning it on not having a bus.
 
 ### The general lesson
 
@@ -358,7 +409,7 @@ the 28x without any indication of why.
 
 An earlier revision of this file reported, from an integrated AMD Radeon 860M,
 that the GPU backward pass was *slower* than the CPU and needed a tiled-binning
-rewrite. On the 4090 it is 1.3-4.7x faster and binning is no longer the
+rewrite. On the 4090 it is 1.3-4.3x faster and binning is no longer the
 bottleneck. The integrated result was real, but it generalized badly: a GPU
 sharing system memory with the CPU is close to the worst case for this workload.
 The conclusion changed because the measurement changed, which is the argument
@@ -371,8 +422,8 @@ having compiled the same WGSL through entirely different toolchains.
 ## Tests
 
 ```sh
-cargo test --release          # 72 Rust tests
-python -m unittest discover -s python -p "test_*.py"   # 43 Python tests
+cargo test --release          # 83 Rust tests
+python -m unittest discover -s python -p "test_*.py"   # 47 Python tests
 cargo clippy --all-targets    # clean
 cargo fmt --all -- --check
 ```
@@ -416,13 +467,15 @@ sigma a fit ends on.
 
 ## Roadmap
 
-- **Per-workgroup gradient reduction.** The measured bottleneck: 86.6% of a
-  batched backward call is dispatch, and the evidence points squarely at atomic
-  contention. See the profile above for the design and its barrier-uniformity
-  hazard.
+- **Buffer pooling.** Now the largest single phase: 45% of a batched backward
+  call at 256px is allocating the image, target and gradient buffers, which
+  training re-creates at identical sizes every step.
+- **GPU-side loss reduction.** A further 40% is reading every rendered pixel
+  back only to reduce it on the host. Reducing on the device would leave the
+  gradients as the only thing crossing the bus.
 - **Tiled binning.** Per-tile triangle lists would stop the shader visiting
   every (pixel, triangle) pair. Lower priority — the 4090 rejects culled pairs
-  almost for free, and contention dominates.
+  almost for free, and dispatch is now 15% of the call.
 - **Gaussian primitives** alongside triangles, closer to how 3D Gaussian
   splatting parameterizes scenes.
 - **Perceptual loss** (LPIPS) in place of MSE, which over-rewards blur.
