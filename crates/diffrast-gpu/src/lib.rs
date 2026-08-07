@@ -67,6 +67,13 @@ impl std::fmt::Display for GpuError {
 
 impl std::error::Error for GpuError {}
 
+/// Buffers for one batch, uploaded once and shared by both dispatches.
+struct PackedBatch {
+    params: wgpu::Buffer,
+    tris: wgpu::Buffer,
+    backgrounds: wgpu::Buffer,
+}
+
 /// A GPU device with the rasterizer pipelines compiled and ready.
 ///
 /// Creating this is expensive — it initializes a device and compiles shaders —
@@ -428,50 +435,15 @@ impl GpuRasterizer {
         let Some(n_tris) = self.check_batch(scenes)? else {
             return Ok(Vec::new());
         };
-
         let batch = scenes.len();
         let pixels = p.width * p.height;
-        let (tri_buf, bg_buf) = self.pack_scenes(scenes);
 
-        let mut params = Self::gpu_params(&scenes[0], p, false);
-        params.n_tris = n_tris as u32;
-        let param_buf = self.uniform(&params);
-
-        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("images"),
-            size: (batch * pixels * 3 * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("forward_batch"),
-            layout: &self.forward_batch.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: param_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: bg_buf.as_entire_binding() },
-            ],
-        });
-
+        let packed = self.pack_batch(scenes, p, n_tris);
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("forward_batch"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.forward_batch);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(
-                p.width.div_ceil(8) as u32,
-                p.height.div_ceil(8) as u32,
-                batch as u32,
-            );
-        }
+        let image_buf = self.encode_forward(&mut encoder, &packed, p, batch);
 
-        let data = self.read_buffer(&mut encoder, &out_buf, (batch * pixels * 3 * 4) as u64)?;
+        let data = self.read_buffer(&mut encoder, &image_buf, (batch * pixels * 3 * 4) as u64)?;
         Ok(data
             .chunks_exact(pixels * 3)
             .map(|chunk| Canvas { width: p.width, height: p.height, data: chunk.to_vec() })
@@ -500,20 +472,24 @@ impl GpuRasterizer {
         };
 
         let batch = scenes.len();
+        let pixels = p.width * p.height;
+        let image_bytes = (batch * pixels * 3 * 4) as u64;
 
-        let rendered = self.render_many(scenes, p)?;
+        let packed = self.pack_batch(scenes, p, n_tris);
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        let (tri_buf, bg_buf) = self.pack_scenes(scenes);
-        let mut params = Self::gpu_params(&scenes[0], p, false);
-        params.n_tris = n_tris as u32;
-        let param_buf = self.uniform(&params);
+        // The rendered batch stays in GPU memory and feeds the backward pass
+        // directly. An earlier version rendered via `render_many`, which copied
+        // the images to the host and immediately uploaded them back — 12.6 MB
+        // round-tripped per call at 256px, which showed up as GPU cost scaling
+        // *superlinearly* with pixel count while scaling sublinearly with
+        // triangle count. Compute does not behave that way; transfers do.
+        let image_buf = self.encode_forward(&mut encoder, &packed, p, batch);
 
-        let flat_rendered: Vec<f32> =
-            rendered.iter().flat_map(|c| c.data.iter().copied()).collect();
         let flat_targets: Vec<f32> = targets.iter().flat_map(|c| c.data.iter().copied()).collect();
-
-        let rendered_buf = self.storage("rendered", &flat_rendered);
         let target_buf = self.storage("targets", &flat_targets);
+
         let grad_len = batch * n_tris * Triangle::N_PARAMS;
         let grad_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("grads"),
@@ -525,17 +501,18 @@ impl GpuRasterizer {
             label: Some("backward_batch"),
             layout: &self.backward_batch.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: param_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: tri_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: rendered_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: packed.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: packed.tris.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: image_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: target_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: grad_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: bg_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: packed.backgrounds.as_entire_binding(),
+                },
             ],
         });
 
-        let mut encoder =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("backward_batch"),
@@ -550,14 +527,21 @@ impl GpuRasterizer {
             );
         }
 
+        // Gradients are tiny; the images come back only because the loss is
+        // reduced on the host. Reducing it on the GPU would remove this last
+        // per-pixel transfer entirely — the next thing worth doing here.
         let grads = self.read_buffer(&mut encoder, &grad_buf, (grad_len * 4) as u64)?;
-        let stride = n_tris * Triangle::N_PARAMS;
+        let images = self.read_buffer(&mut encoder, &image_buf, image_bytes)?;
 
-        Ok(rendered
-            .iter()
+        let stride = n_tris * Triangle::N_PARAMS;
+        Ok(images
+            .chunks_exact(pixels * 3)
             .zip(targets)
             .zip(grads.chunks_exact(stride))
-            .map(|((r, t), g)| (r.mse(t), g.to_vec()))
+            .map(|((rendered, target), g)| {
+                let canvas = Canvas { width: p.width, height: p.height, data: rendered.to_vec() };
+                (canvas.mse(target), g.to_vec())
+            })
             .collect())
     }
 
@@ -580,11 +564,64 @@ impl GpuRasterizer {
         Ok(Some(n_tris))
     }
 
-    /// Pack a batch's triangles and backgrounds into two buffers.
-    fn pack_scenes(&self, scenes: &[Scene]) -> (wgpu::Buffer, wgpu::Buffer) {
+    /// Per-batch buffers, uploaded once and reused by both dispatches.
+    fn pack_batch(&self, scenes: &[Scene], p: RenderParams, n_tris: usize) -> PackedBatch {
         let tris: Vec<f32> = scenes.iter().flat_map(|s| s.params()).collect();
         let backgrounds: Vec<f32> = scenes.iter().flat_map(|s| s.background).collect();
-        (self.storage("triangles", &tris), self.storage("backgrounds", &backgrounds))
+        let mut params = Self::gpu_params(&scenes[0], p, false);
+        params.n_tris = n_tris as u32;
+
+        PackedBatch {
+            params: self.uniform(&params),
+            tris: self.storage("triangles", &tris),
+            backgrounds: self.storage("backgrounds", &backgrounds),
+        }
+    }
+
+    /// Record the batched forward pass and return the buffer it writes into.
+    /// The buffer stays on the device; nothing is read back here.
+    fn encode_forward(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        packed: &PackedBatch,
+        p: RenderParams,
+        batch: usize,
+    ) -> wgpu::Buffer {
+        let image_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("images"),
+            size: (batch * p.width * p.height * 3 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("forward_batch"),
+            layout: &self.forward_batch.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: packed.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: packed.tris.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: image_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: packed.backgrounds.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("forward_batch"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.forward_batch);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(
+            p.width.div_ceil(8) as u32,
+            p.height.div_ceil(8) as u32,
+            batch as u32,
+        );
+        drop(pass);
+
+        image_buf
     }
 
     fn storage(&self, label: &str, data: &[f32]) -> wgpu::Buffer {
