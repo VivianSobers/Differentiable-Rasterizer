@@ -144,9 +144,43 @@ fn main() {
         );
     }
 
+    // Where the GPU actually starts winning. Batching removes per-dispatch
+    // overhead but does not make the GPU unconditionally faster: a 26-core CPU
+    // parallelizes across batch items nearly perfectly, and for small per-item
+    // work it wins outright. The dispatch rule should come from this table
+    // rather than from an assumption that "GPU is faster".
+    println!("\n=== crossover: CPU rayon vs GPU batched (batch of 16) ===");
+    println!(
+        "{:<30} {:>11} {:>12} {:>10}  {}",
+        "per-item work", "cpu rayon", "gpu batched", "gpu/cpu", "winner"
+    );
+    for &size in &[64usize, 128, 256] {
+        for &tris in &[32usize, 128, 512] {
+            let batch = 16;
+            let p = RenderParams::new(size, size, 0.01);
+            let scenes: Vec<Scene> = (0..batch).map(|_| scene_of(tris)).collect();
+            let targets: Vec<Canvas> =
+                (0..batch).map(|_| Canvas::filled(size, size, [0.4, 0.5, 0.6])).collect();
+
+            let cpu_time = time(2, || cpu_backward_batch(&scenes, p, &targets));
+            let gpu_time = time(2, || gpu.backward_many(&scenes, p, &targets).expect("batched"));
+            let ratio = cpu_time / gpu_time;
+
+            println!(
+                "{:<30} {:>10.2}ms {:>11.2}ms {:>9.2}x  {}",
+                format!("{size}x{size}, {tris} tris"),
+                cpu_time * 1e3,
+                gpu_time * 1e3,
+                ratio,
+                if ratio > 1.0 { "GPU" } else { "cpu" }
+            );
+        }
+    }
+
     println!(
         "\nnote: timings include buffer upload and readback, so short renders are\n\
          dominated by transfer rather than compute. \"batch win\" isolates that:\n\
-         same total work, one dispatch instead of N."
+         same total work, one dispatch instead of N. The crossover table is the\n\
+         one to read before choosing a device for training."
     );
 }
