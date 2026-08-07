@@ -20,7 +20,6 @@ use bytemuck::{Pod, Zeroable};
 use diffrast::canvas::Canvas;
 use diffrast::raster::RenderParams;
 use diffrast::scene::{Scene, Triangle};
-use rayon::prelude::*;
 use wgpu::util::DeviceExt;
 
 /// Must match the `Params` struct in `common.wgsl`, including padding.
@@ -201,6 +200,7 @@ pub struct GpuRasterizer {
     forward_batch: wgpu::ComputePipeline,
     backward_batch: wgpu::ComputePipeline,
     backward_batch_reduced: wgpu::ComputePipeline,
+    loss_batch: wgpu::ComputePipeline,
     pool: Mutex<BufferPool>,
     info: String,
 }
@@ -296,6 +296,10 @@ impl GpuRasterizer {
             &format!("{common}\n{}", include_str!("shaders/backward_batch_reduced.wgsl")),
         );
 
+        // No `common` prefix: this one touches no geometry.
+        let loss_batch =
+            Self::pipeline(&device, "loss_batch", include_str!("shaders/loss_batch.wgsl"));
+
         Ok(Self {
             device,
             queue,
@@ -305,6 +309,7 @@ impl GpuRasterizer {
             forward_batch,
             backward_batch,
             backward_batch_reduced,
+            loss_batch,
             pool: Mutex::new(BufferPool::default()),
             info,
         })
@@ -623,17 +628,24 @@ impl GpuRasterizer {
         p: RenderParams,
         targets: &[Canvas],
     ) -> Result<BatchGradients, GpuError> {
-        self.backward_many_timed(scenes, p, targets).map(|(r, _)| r)
+        self.backward_many_inner(scenes, p, targets, ReduceMode::default(), false).map(|(r, _)| r)
     }
 
     /// As [`Self::backward_many`], but also reports where the time went.
+    ///
+    /// **Measuring costs something.** Phases are separated by waiting for the
+    /// queue to drain between them; without that the whole call is recorded
+    /// into one encoder and submitted once, and every phase before the
+    /// readback measures nothing but CPU-side recording. So this is slightly
+    /// slower than [`Self::backward_many`] and its total is an upper bound.
+    /// The breakdown is a diagnostic, not the number to quote.
     pub fn backward_many_timed(
         &self,
         scenes: &[Scene],
         p: RenderParams,
         targets: &[Canvas],
     ) -> Result<(BatchGradients, BackwardTimings), GpuError> {
-        self.backward_many_full(scenes, p, targets, ReduceMode::default())
+        self.backward_many_inner(scenes, p, targets, ReduceMode::default(), true)
     }
 
     /// Full form: choose how gradients are reduced, and get phase timings back.
@@ -643,6 +655,17 @@ impl GpuRasterizer {
         p: RenderParams,
         targets: &[Canvas],
         reduce: ReduceMode,
+    ) -> Result<(BatchGradients, BackwardTimings), GpuError> {
+        self.backward_many_inner(scenes, p, targets, reduce, false)
+    }
+
+    fn backward_many_inner(
+        &self,
+        scenes: &[Scene],
+        p: RenderParams,
+        targets: &[Canvas],
+        reduce: ReduceMode,
+        sync_phases: bool,
     ) -> Result<(BatchGradients, BackwardTimings), GpuError> {
         let mut t = BackwardTimings::default();
         let mut clock = std::time::Instant::now();
@@ -743,36 +766,36 @@ impl GpuRasterizer {
             );
         }
 
-        // Gradients are tiny; the images come back only because the loss is
-        // reduced on the host. Reducing it on the GPU would remove this last
-        // per-pixel transfer entirely — the next thing worth doing here.
-        let grads = self.read_buffer(&mut encoder, &grad_buf, (grad_len * 4) as u64)?;
+        // The loss is reduced on the device, so nothing per-pixel crosses the
+        // bus. Reading the batch back to sum it on the host cost more than the
+        // backward dispatch itself once contention was fixed.
+        let counts_buf = self.loss_counts(pixels);
+        let loss_buf = self.pooled(
+            "losses",
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            (batch * 4) as u64,
+        );
+        self.encode_loss(&mut encoder, &counts_buf, &image_buf, &target_buf, &loss_buf, batch);
+
+        // Everything above only *records* commands. Nothing has reached the
+        // device until a submit, so attributing GPU execution to a phase means
+        // draining the queue here — see the note on `backward_many_timed`.
+        if sync_phases {
+            self.submit_and_wait(&mut encoder)?;
+        }
         lap(&mut t.dispatch_ms);
 
-        let images = self.read_buffer(&mut encoder, &image_buf, image_bytes)?;
+        // One submission and one map for both results instead of two.
+        let read = self.read_buffers(
+            &mut encoder,
+            &[(&grad_buf, (grad_len * 4) as u64), (&loss_buf, (batch * 4) as u64)],
+        )?;
+        let (grads, losses) = read.split_at(grad_len);
         lap(&mut t.readback_ms);
 
-        // Reduced in parallel and without copying. The previous version cloned
-        // each item into a `Canvas` purely to call `mse` on it, allocating the
-        // whole batch a second time on the host for no reason.
         let stride = n_tris * Triangle::N_PARAMS;
-        let scale = 1.0 / (pixels * 3) as f64;
-        let out: BatchGradients = images
-            .par_chunks_exact(pixels * 3)
-            .zip(targets.par_iter())
-            .zip(grads.par_chunks_exact(stride))
-            .map(|((rendered, target), g)| {
-                let sum: f64 = rendered
-                    .iter()
-                    .zip(&target.data)
-                    .map(|(a, b)| {
-                        let d = (a - b) as f64;
-                        d * d
-                    })
-                    .sum();
-                ((sum * scale) as f32, g.to_vec())
-            })
-            .collect();
+        let out: BatchGradients =
+            losses.iter().zip(grads.chunks_exact(stride)).map(|(l, g)| (*l, g.to_vec())).collect();
         lap(&mut t.loss_ms);
 
         Ok((out, t))
@@ -933,6 +956,53 @@ impl GpuRasterizer {
         buffer
     }
 
+    /// The one uniform the loss shader needs: values per image.
+    fn loss_counts(&self, pixels: usize) -> Pooled<'_> {
+        let buffer = self.pooled(
+            "loss_counts",
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            16,
+        );
+        let counts = [(pixels * 3) as u32, 0, 0, 0];
+        self.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&counts));
+        buffer
+    }
+
+    /// Record the per-item MSE reduction. One workgroup per batch item.
+    ///
+    /// Every buffer is passed in rather than created here so the caller owns
+    /// them for the whole submission. A pooled buffer released before its work
+    /// is submitted could be handed to another thread and rewritten underneath
+    /// a queued dispatch.
+    fn encode_loss(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        counts_buf: &wgpu::Buffer,
+        image_buf: &wgpu::Buffer,
+        target_buf: &wgpu::Buffer,
+        loss_buf: &wgpu::Buffer,
+        batch: usize,
+    ) {
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("loss_batch"),
+            layout: &self.loss_batch.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: counts_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: image_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: target_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: loss_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("loss_batch"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.loss_batch);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(batch as u32, 1, 1);
+    }
+
     /// Record the batched forward pass into `image_buf`. Nothing is read back
     /// here; the buffer stays on the device for the backward pass to consume.
     fn encode_forward(
@@ -986,6 +1056,23 @@ impl GpuRasterizer {
         })
     }
 
+    /// Submit whatever is recorded and block until the device has finished it.
+    fn submit_and_wait(&self, encoder: &mut wgpu::CommandEncoder) -> Result<(), GpuError> {
+        let recorded = std::mem::replace(
+            encoder,
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
+        );
+        self.queue.submit(Some(recorded.finish()));
+        match self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Self::POLL_TIMEOUT),
+        }) {
+            Ok(_) => Ok(()),
+            Err(wgpu::PollError::Timeout) => Err(GpuError::Timeout),
+            Err(e) => Err(GpuError::Readback(format!("{e:?}"))),
+        }
+    }
+
     /// Copy a storage buffer back to the host as `f32`s.
     fn read_buffer(
         &self,
@@ -993,6 +1080,19 @@ impl GpuRasterizer {
         source: &wgpu::Buffer,
         size: u64,
     ) -> Result<Vec<f32>, GpuError> {
+        self.read_buffers(encoder, &[(source, size)])
+    }
+
+    /// Copy several buffers back in one submission, concatenated in order.
+    ///
+    /// A round trip costs a submit, a map and a poll regardless of how little
+    /// it carries, so two small results are worth fetching together.
+    fn read_buffers(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        sources: &[(&wgpu::Buffer, u64)],
+    ) -> Result<Vec<f32>, GpuError> {
+        let size: u64 = sources.iter().map(|(_, n)| n).sum();
         let staging = self.pooled(
             "staging",
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
@@ -1003,7 +1103,11 @@ impl GpuRasterizer {
             encoder,
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
         );
-        encoder.copy_buffer_to_buffer(source, 0, &staging, 0, size);
+        let mut offset = 0;
+        for (source, bytes) in sources {
+            encoder.copy_buffer_to_buffer(source, 0, &staging, offset, *bytes);
+            offset += bytes;
+        }
         self.queue.submit(Some(encoder.finish()));
 
         let slice = staging.slice(..);
@@ -1269,6 +1373,27 @@ mod tests {
         let p = RenderParams::new(16, 16, 0.02);
         assert!(gpu.render_many(&[], p).expect("empty").is_empty());
         assert!(gpu.backward_many(&[], p, &[]).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn device_side_loss_matches_a_host_reduction() {
+        // Deliberately large. The host sums in f64 and the shader sums a tree
+        // of f32 partials, so the two only have to agree to f32's precision —
+        // and the gap grows with how many values are summed. 192x192x3 is
+        // 110,592 per image, well past where a naive f32 sum would drift.
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(192, 192, 0.01);
+        let scenes: Vec<Scene> = (0..3).map(|_| test_scene(12)).collect();
+        let targets: Vec<Canvas> =
+            (0..3).map(|i| Canvas::filled(192, 192, [0.9 - i as f32 * 0.3, 0.2, 0.7])).collect();
+
+        let batched = gpu.backward_many(&scenes, p, &targets).expect("batched");
+        let rendered = gpu.render_many(&scenes, p).expect("rendered");
+
+        for (i, (loss, _)) in batched.iter().enumerate() {
+            let host = rendered[i].mse(&targets[i]);
+            assert!((host - loss).abs() < 1e-6, "item {i}: host {host} vs device {loss}");
+        }
     }
 
     #[test]
