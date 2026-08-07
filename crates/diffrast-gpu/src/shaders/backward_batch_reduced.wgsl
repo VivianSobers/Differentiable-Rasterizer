@@ -124,12 +124,16 @@ fn main(
     var g = vec3<f32>(0.0, 0.0, 0.0);
     if (in_range) {
         let o = (b * pixels + y * params.width + x) * 3u;
-        let scale = 2.0 / f32(pixels * 3u);
-        g = vec3<f32>(
-            scale * (rendered[o] - target_image[o]),
-            scale * (rendered[o + 1u] - target_image[o + 1u]),
-            scale * (rendered[o + 2u] - target_image[o + 2u]),
-        );
+        if (params.grad_input != 0u) {
+            g = vec3<f32>(target_image[o], target_image[o + 1u], target_image[o + 2u]);
+        } else {
+            let scale = 2.0 / f32(pixels * 3u);
+            g = vec3<f32>(
+                scale * (rendered[o] - target_image[o]),
+                scale * (rendered[o + 1u] - target_image[o + 1u]),
+                scale * (rendered[o + 2u] - target_image[o + 2u]),
+            );
+        }
     }
 
     // Chunks run front-to-back, matching the reverse compositing order. The

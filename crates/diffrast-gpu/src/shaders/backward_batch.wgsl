@@ -76,13 +76,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Normalized per image, not per batch, so each item's loss matches what the
     // single-scene path reports and batching stays a pure scheduling change.
-    let n = f32(pixels * 3u);
-    let scale = 2.0 / n;
-    var g = vec3<f32>(
-        scale * (rendered[o] - target_image[o]),
-        scale * (rendered[o + 1u] - target_image[o + 1u]),
-        scale * (rendered[o + 2u] - target_image[o + 2u]),
-    );
+    var g = vec3<f32>(0.0, 0.0, 0.0);
+    if (params.grad_input != 0u) {
+        g = vec3<f32>(target_image[o], target_image[o + 1u], target_image[o + 2u]);
+    } else {
+        let scale = 2.0 / f32(pixels * 3u);
+        g = vec3<f32>(
+            scale * (rendered[o] - target_image[o]),
+            scale * (rendered[o + 1u] - target_image[o + 1u]),
+            scale * (rendered[o + 2u] - target_image[o + 2u]),
+        );
+    }
 
     let sigma = max(params.sigma, 1e-8);
     let tri_base = b * params.n_tris;
