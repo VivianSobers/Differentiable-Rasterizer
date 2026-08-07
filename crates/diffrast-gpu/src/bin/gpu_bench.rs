@@ -151,8 +151,8 @@ fn main() {
     // rather than from an assumption that "GPU is faster".
     println!("\n=== crossover: CPU rayon vs GPU batched (batch of 16) ===");
     println!(
-        "{:<30} {:>11} {:>12} {:>10}  {}",
-        "per-item work", "cpu rayon", "gpu batched", "gpu/cpu", "winner"
+        "{:<30} {:>11} {:>12} {:>10}  winner",
+        "per-item work", "cpu rayon", "gpu batched", "gpu/cpu"
     );
     for &size in &[64usize, 128, 256] {
         for &tris in &[32usize, 128, 512] {
