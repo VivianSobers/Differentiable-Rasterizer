@@ -369,6 +369,48 @@ compute is 1.95 ms against the CPU's 11.90 ms — a 6x win it never gets to bank
 because 11 ms of allocation and transfer sit on top of it. The CPU is not
 winning that cell on arithmetic; it is winning it on not having a bus.
 
+### Removing the overhead
+
+Two changes, both aimed at that 78%.
+
+**Buffer pooling.** Every call allocated a fresh image buffer, target buffer,
+gradient accumulator and staging buffer, then dropped them — at identical sizes,
+thousands of times, because that is what a training loop is. They now come from
+a pool keyed on `(usage, size)`. The gradient accumulator is the one that cannot
+simply be reused as-is, since it is added into rather than overwritten; it gets
+a device-side `clear_buffer` instead of an upload of zeros. The concatenated
+host-side copy of the target batch went with it — targets are written straight
+into the buffer per image, which removes a 12.6 MB `memcpy` per call.
+
+**Device-side loss.** `loss_batch.wgsl` reduces per-image MSE with one workgroup
+per batch item, so the rendered batch never leaves the device. Previously the
+host read back 12.6 MB in order to produce 16 floats. Gradients and losses are
+then fetched in a single mapped readback rather than two.
+
+On the integrated AMD card, batch of 16 at 256px:
+
+| phase | before | after |
+| --- | --- | --- |
+| alloc | 5.06 ms | 2.48 ms |
+| readback | 5.98 ms | 1.73 ms |
+| loss | 2.18 ms | **0.01 ms** |
+| **overhead total** | **13.22 ms** | **4.22 ms** |
+
+A **3.1x** cut in everything that is not dispatch. Total call time only improves
+12% there, because on that card dispatch is 40 of 46 ms and dominates
+regardless.
+
+The 4090 is the opposite shape — 11.06 ms of overhead against 1.95 ms of
+dispatch — so the same 3x should matter far more, and predicts the 32-triangle
+column flipping to the GPU. **That is a prediction, not a measurement.** Two
+earlier predictions in this file were wrong in exactly this spot, so it stays
+labelled as one until `collect-gpu-report.sh` runs on the 4090.
+
+Reuse is asserted rather than assumed: `buffers_are_reused_across_identical_calls`
+checks that a repeated call allocates *nothing* and returns bit-identical
+gradients. A pool that silently never hit would be invisible in a timing, and
+`pool_stats()` exists so the test can look instead of infer.
+
 ### The general lesson
 
 The profile said "the GPU is slow at high resolution". The first answer was "it
@@ -422,8 +464,8 @@ having compiled the same WGSL through entirely different toolchains.
 ## Tests
 
 ```sh
-cargo test --release          # 83 Rust tests
-python -m unittest discover -s python -p "test_*.py"   # 47 Python tests
+cargo test --release          # 86 Rust tests
+python -m unittest discover -s python -p "test_*.py"   # 50 Python tests
 cargo clippy --all-targets    # clean
 cargo fmt --all -- --check
 ```
@@ -467,12 +509,10 @@ sigma a fit ends on.
 
 ## Roadmap
 
-- **Buffer pooling.** Now the largest single phase: 45% of a batched backward
-  call at 256px is allocating the image, target and gradient buffers, which
-  training re-creates at identical sizes every step.
-- **GPU-side loss reduction.** A further 40% is reading every rendered pixel
-  back only to reduce it on the host. Reducing on the device would leave the
-  gradients as the only thing crossing the bus.
+- **Re-measure on the 4090.** Pooling and the device-side loss are measured on
+  an integrated card only; the prediction that they flip the 32-triangle column
+  is unverified, and the `auto` thresholds should be re-derived from whatever
+  the new crossover says.
 - **Tiled binning.** Per-tile triangle lists would stop the shader visiting
   every (pixel, triangle) pair. Lower priority — the 4090 rejects culled pairs
   almost for free, and dispatch is now 15% of the call.
