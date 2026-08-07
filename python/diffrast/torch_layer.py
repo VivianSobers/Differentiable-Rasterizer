@@ -122,6 +122,15 @@ def last_device() -> str:
     return diffrast_rs.last_device()
 
 
+def policy_prefers_gpu(batch: int, triangles: int, pixels: int) -> bool:
+    """Whether `device="auto"`'s size rule favours the GPU for this shape.
+
+    The size rule only — `auto` also requires an adapter. Useful for answering
+    "why did auto pick the CPU here?" without timing anything.
+    """
+    return diffrast_rs.policy_prefers_gpu(batch, triangles, pixels)
+
+
 def fused_loss(
     params: Tensor,
     targets: Tensor,

@@ -22,6 +22,7 @@ try:
         fused_loss,
         gpu_adapter,
         last_device,
+        policy_prefers_gpu,
         psnr,
         random_params,
         rasterize,
@@ -225,6 +226,56 @@ class TestFusedLoss(unittest.TestCase):
         p = random_params(1, 4, generator=torch.Generator().manual_seed(0))
         with self.assertRaises(ValueError):
             fused_loss(p, torch.rand(1, 3, 8, 8, 1))
+
+
+@unittest.skipUnless(HAVE_TORCH, "torch or diffrast_rs not installed")
+class TestDispatchPolicy(unittest.TestCase):
+    """Pin `device="auto"` to the crossover it claims to be derived from.
+
+    The table is `gpu_bench`'s crossover on an idle RTX 4090 against a 26-core
+    i9-13900, batch of 16, as recorded in `docs/gpu-report.txt`. Values are
+    GPU-over-CPU speedups: above 1.0 the GPU won. Cells inside +/-10% are
+    genuine ties and are not asserted on — either choice is defensible there,
+    and pinning a tie would make the test fail on noise rather than on a
+    regression.
+
+    This runs without a GPU, which is the point: it checks the *rule*, not the
+    hardware. `test_device_routing_is_honoured` covers the rule being obeyed.
+    """
+
+    MEASURED = [
+        # (pixels, triangles, gpu speedup over cpu)
+        (64 * 64, 32, 0.83),
+        (64 * 64, 128, 2.04),
+        (64 * 64, 512, 2.37),
+        (128 * 128, 32, 1.02),
+        (128 * 128, 128, 3.61),
+        (128 * 128, 512, 3.52),
+        (256 * 256, 32, 0.79),
+        (256 * 256, 128, 2.41),
+        (256 * 256, 512, 3.38),
+    ]
+
+    def test_policy_matches_the_measured_crossover(self) -> None:
+        for pixels, tris, speedup in self.MEASURED:
+            if 0.9 <= speedup <= 1.1:
+                continue
+            with self.subTest(pixels=pixels, triangles=tris):
+                self.assertEqual(
+                    policy_prefers_gpu(16, tris, pixels),
+                    speedup > 1.0,
+                    f"{tris} tris at {pixels} px measured {speedup:.2f}x",
+                )
+
+    def test_tiny_batches_stay_on_the_cpu(self) -> None:
+        # One image cannot amortize a dispatch no matter how much geometry it
+        # carries; batching is the whole reason the GPU path exists.
+        self.assertFalse(policy_prefers_gpu(1, 512, 256 * 256))
+        self.assertTrue(policy_prefers_gpu(16, 512, 256 * 256))
+
+    def test_trivial_workloads_stay_on_the_cpu(self) -> None:
+        # Below the floor the fixed overhead dominates whatever it saves.
+        self.assertFalse(policy_prefers_gpu(4, 64, 16 * 16))
 
 
 @unittest.skipUnless(HAVE_TORCH, "torch or diffrast_rs not installed")
