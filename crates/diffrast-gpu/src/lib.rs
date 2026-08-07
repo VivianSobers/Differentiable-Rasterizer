@@ -37,6 +37,8 @@ struct GpuParams {
 #[derive(Debug)]
 pub enum GpuError {
     NoAdapter,
+    /// The device did not finish the work within [`GpuRasterizer::POLL_TIMEOUT`].
+    Timeout,
     DeviceRequest(String),
     Readback(String),
     /// The requested work exceeds a device limit.
@@ -49,6 +51,12 @@ impl std::fmt::Display for GpuError {
             Self::NoAdapter => write!(
                 f,
                 "no GPU adapter found — install a Vulkan/Metal/DX12 driver, or use the CPU path"
+            ),
+            Self::Timeout => write!(
+                f,
+                "the GPU did not finish within {:?} — it may be busy with another process \
+                 (check `nvidia-smi`), or the workload may be too large for one submission",
+                GpuRasterizer::POLL_TIMEOUT
             ),
             Self::DeviceRequest(m) => write!(f, "could not create device: {m}"),
             Self::Readback(m) => write!(f, "could not read results back: {m}"),
@@ -88,6 +96,14 @@ pub enum BackwardMode {
 }
 
 impl GpuRasterizer {
+    /// How long to wait for a submission before giving up.
+    ///
+    /// Bounded on purpose. An unbounded wait turns any stall — a device shared
+    /// with another process, a lost submission, a driver hiccup — into a
+    /// process that hangs forever with no diagnostic. Failing with a message
+    /// after a minute is strictly better than blocking indefinitely.
+    pub const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Initialize the default adapter.
     pub fn new() -> Result<Self, GpuError> {
         pollster::block_on(Self::new_async())
@@ -613,9 +629,14 @@ impl GpuRasterizer {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| GpuError::Readback(format!("{e:?}")))?;
+        match self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Self::POLL_TIMEOUT),
+        }) {
+            Ok(_) => {}
+            Err(wgpu::PollError::Timeout) => return Err(GpuError::Timeout),
+            Err(e) => return Err(GpuError::Readback(format!("{e:?}"))),
+        }
 
         match rx.recv() {
             Ok(Ok(())) => {}
@@ -639,19 +660,28 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
-    /// Skips rather than fails when no adapter exists, so the suite still runs
-    /// on machines without a usable GPU driver.
-    fn gpu() -> Option<GpuRasterizer> {
-        match GpuRasterizer::new() {
+    /// One device shared by every test in this binary.
+    ///
+    /// `cargo test` runs tests on parallel threads, and creating a device per
+    /// test meant a dozen simultaneous Vulkan devices on one card. That is
+    /// wasteful everywhere and, on a GPU shared with other work, a good way to
+    /// exhaust it. Initializing once also skips a dozen shader compilations.
+    ///
+    /// Returns `None` when no adapter exists, so the suite still runs on
+    /// machines without a usable GPU driver.
+    fn gpu() -> Option<&'static GpuRasterizer> {
+        static GPU: std::sync::OnceLock<Option<GpuRasterizer>> = std::sync::OnceLock::new();
+        GPU.get_or_init(|| match GpuRasterizer::new() {
             Ok(g) => {
                 eprintln!("gpu: {}", g.adapter_info());
                 Some(g)
             }
             Err(e) => {
-                eprintln!("skipping GPU test: {e}");
+                eprintln!("skipping GPU tests: {e}");
                 None
             }
-        }
+        })
+        .as_ref()
     }
 
     fn test_scene(n: usize) -> Scene {
