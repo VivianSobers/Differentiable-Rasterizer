@@ -273,17 +273,38 @@ Four independent observations all point there:
 4. **The GPU wins exactly where contention is lowest** — many triangles, which
    is also where the crossover table flips to `GPU`.
 
-The fix is a per-workgroup reduction: accumulate into workgroup-shared memory
-first, then perform one global atomic per triangle per workgroup instead of one
-per pixel. With a 64-thread workgroup that is up to 64x fewer global atomics.
+### The fix, and what it confirmed
 
-It needs care rather than enthusiasm. `workgroupBarrier` must be reached by
-every thread in the workgroup, and the current shader both `return`s early for
-out-of-range pixels and `continue`s past culled triangles — either would make a
-barrier non-uniform, which is undefined behaviour rather than a wrong answer.
-The restructure is: drop the early return in favour of a predicate, process
-triangles in fixed-size chunks so the barriers sit in uniform control flow, and
-flush each chunk's partials to global memory before the next.
+`ReduceMode::Workgroup` accumulates into workgroup-shared memory first, then
+performs one global atomic per triangle per *workgroup* instead of one per
+pixel — up to 64x fewer global atomics at a 64-thread workgroup. It is the
+default.
+
+Speedup over the previous path, batch of 16:
+
+| | 32 triangles | 128 triangles | 512 triangles |
+| --- | --- | --- | --- |
+| **64x64** | 2.70x | 2.54x | 2.07x |
+| **128x128** | 4.47x | 3.24x | 2.83x |
+| **256x256** | **6.87x** | 4.17x | 3.07x |
+
+The *shape* of that table is the real result. Contention theory predicts the win
+grows with pixel count (more threads queuing) and shrinks with triangle count
+(more accumulator slots to spread across). Both hold, in both directions, across
+all nine cells.
+
+And the anomaly that started this is gone. Dispatch scaling per 4x pixels was
+**12.6x**; it is now **~4.3x** — linear, which is what compute-bound looks like.
+
+Barrier uniformity was the whole difficulty. `workgroupBarrier` is undefined
+behaviour unless every thread reaches it, and the straightforward shader both
+`return`s early for out-of-range pixels and `continue`s past culled triangles.
+The restructure: an `in_range` predicate instead of the early return, triangles
+processed in fixed-size chunks so barriers sit in control flow that depends only
+on `n_tris`, and each chunk's partials flushed before the next clears them.
+`workgroup_reduction_handles_non_multiple_sizes` covers the cases that would
+expose a mistake — a 37x19 canvas with 33 triangles, where edge threads are
+inactive and the last chunk is partial.
 
 ### The general lesson
 
