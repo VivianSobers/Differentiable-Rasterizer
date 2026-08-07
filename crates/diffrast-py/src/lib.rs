@@ -69,6 +69,23 @@ fn parse_device(name: &str) -> PyResult<Device> {
     }
 }
 
+/// Resolve a requested device into "use the GPU or not", erroring only when
+/// the GPU was demanded explicitly and is unavailable.
+fn resolve_device(device: Device, batch: usize, tris: usize, pixels: usize) -> PyResult<bool> {
+    Ok(match device {
+        Device::Cpu => false,
+        Device::Gpu => {
+            if gpu().is_none() {
+                return Err(PyValueError::new_err(
+                    "device=\"gpu\" requested but no adapter is available",
+                ));
+            }
+            true
+        }
+        Device::Auto => prefer_gpu(batch, tris, pixels),
+    })
+}
+
 /// Should this workload go to the GPU?
 ///
 /// The rule comes from the measured crossover rather than a preference for the
@@ -110,7 +127,7 @@ fn check_sigma(sigma: f32) -> PyResult<()> {
 ///
 /// `params` is `(B, T, 10)`; returns `(B, H, W, 3)` in linear light.
 #[pyfunction]
-#[pyo3(signature = (params, height, width, sigma, background=(0.0, 0.0, 0.0)))]
+#[pyo3(signature = (params, height, width, sigma, background=(0.0, 0.0, 0.0), device="auto"))]
 fn render_batch<'py>(
     py: Python<'py>,
     params: PyReadonlyArray3<'py, f32>,
@@ -118,7 +135,9 @@ fn render_batch<'py>(
     width: usize,
     sigma: f32,
     background: (f32, f32, f32),
+    device: &str,
 ) -> PyResult<Bound<'py, PyArray4<f32>>> {
+    let device = parse_device(device)?;
     check_sigma(sigma)?;
     if height == 0 || width == 0 {
         return Err(PyValueError::new_err("height and width must be non-zero"));
@@ -139,7 +158,22 @@ fn render_batch<'py>(
 
     // Release the GIL: without this the rayon pool below would be serialized
     // against the interpreter and the batch would run single-threaded.
+    let use_gpu = resolve_device(device, batch, tris, height * width)?;
+
     let images: Vec<f32> = py.detach(|| {
+        if use_gpu {
+            let scenes: Vec<Scene> =
+                flat.chunks(stride).map(|row| scene_from_params(row, bg)).collect();
+            match gpu().unwrap().render_many(&scenes, rp) {
+                Ok(out) => {
+                    note_device(true);
+                    return out.into_iter().flat_map(|c| c.data).collect();
+                }
+                Err(e) => eprintln!("diffrast: GPU render failed ({e}), falling back to CPU"),
+            }
+        }
+        note_device(false);
+
         flat.par_chunks(stride)
             .flat_map(|row| {
                 let scene = scene_from_params(row, bg);
@@ -164,14 +198,16 @@ fn render_batch<'py>(
 /// `t = r - grad * N / 2`. Composing that way means the chain rule is applied
 /// by one well-tested code path rather than two that could drift apart.
 #[pyfunction]
-#[pyo3(signature = (params, grad_images, sigma, background=(0.0, 0.0, 0.0)))]
+#[pyo3(signature = (params, grad_images, sigma, background=(0.0, 0.0, 0.0), device="auto"))]
 fn backward_batch<'py>(
     py: Python<'py>,
     params: PyReadonlyArray3<'py, f32>,
     grad_images: PyReadonlyArray4<'py, f32>,
     sigma: f32,
     background: (f32, f32, f32),
+    device: &str,
 ) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let device = parse_device(device)?;
     check_sigma(sigma)?;
 
     let params = params.as_array();
@@ -201,7 +237,22 @@ fn backward_batch<'py>(
     let image_stride = height * width * 3;
     let n_pixels = image_stride as f32;
 
+    let use_gpu = resolve_device(device, batch, tris, height * width)?;
+
     let out: Vec<f32> = py.detach(|| {
+        if use_gpu {
+            let scenes: Vec<Scene> =
+                flat_params.chunks(param_stride).map(|row| scene_from_params(row, bg)).collect();
+            match gpu().unwrap().backward_many_from_grad(&scenes, rp, &flat_grads) {
+                Ok(out) => {
+                    note_device(true);
+                    return out.into_iter().flatten().collect();
+                }
+                Err(e) => eprintln!("diffrast: GPU backward failed ({e}), falling back to CPU"),
+            }
+        }
+        note_device(false);
+
         flat_params
             .par_chunks(param_stride)
             .zip(flat_grads.par_chunks(image_stride))
@@ -271,18 +322,7 @@ fn fused_loss_backward<'py>(
     let param_stride = tris * N_PARAMS;
     let image_stride = height * width * 3;
 
-    let use_gpu = match device {
-        Device::Cpu => false,
-        Device::Gpu => {
-            if gpu().is_none() {
-                return Err(PyValueError::new_err(
-                    "device=\"gpu\" requested but no adapter is available",
-                ));
-            }
-            true
-        }
-        Device::Auto => prefer_gpu(batch, tris, height * width),
-    };
+    let use_gpu = resolve_device(device, batch, tris, height * width)?;
 
     let results: Vec<(f32, Vec<f32>)> = py.detach(|| {
         if use_gpu {
