@@ -68,6 +68,18 @@ impl std::fmt::Display for GpuError {
 
 impl std::error::Error for GpuError {}
 
+/// How the batched backward pass accumulates gradients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReduceMode {
+    /// One global atomic per contributing pixel.
+    Direct,
+    /// Accumulate in workgroup memory, then one global atomic per triangle per
+    /// workgroup. Default: contention on the accumulators is the measured
+    /// bottleneck, and this is what addresses it.
+    #[default]
+    Workgroup,
+}
+
 /// Per-item `(loss, gradients)`, one entry per scene in a batch.
 pub type BatchGradients = Vec<(f32, Vec<f32>)>;
 
@@ -117,6 +129,7 @@ pub struct GpuRasterizer {
     backward_recompute: wgpu::ComputePipeline,
     forward_batch: wgpu::ComputePipeline,
     backward_batch: wgpu::ComputePipeline,
+    backward_batch_reduced: wgpu::ComputePipeline,
     info: String,
 }
 
@@ -205,6 +218,12 @@ impl GpuRasterizer {
             &format!("{common}\n{}", include_str!("shaders/backward_batch.wgsl")),
         );
 
+        let backward_batch_reduced = Self::pipeline(
+            &device,
+            "backward_batch_reduced",
+            &format!("{common}\n{}", include_str!("shaders/backward_batch_reduced.wgsl")),
+        );
+
         Ok(Self {
             device,
             queue,
@@ -213,6 +232,7 @@ impl GpuRasterizer {
             backward_recompute,
             forward_batch,
             backward_batch,
+            backward_batch_reduced,
             info,
         })
     }
@@ -501,6 +521,17 @@ impl GpuRasterizer {
         p: RenderParams,
         targets: &[Canvas],
     ) -> Result<(BatchGradients, BackwardTimings), GpuError> {
+        self.backward_many_full(scenes, p, targets, ReduceMode::default())
+    }
+
+    /// Full form: choose how gradients are reduced, and get phase timings back.
+    pub fn backward_many_full(
+        &self,
+        scenes: &[Scene],
+        p: RenderParams,
+        targets: &[Canvas],
+        reduce: ReduceMode,
+    ) -> Result<(BatchGradients, BackwardTimings), GpuError> {
         let mut t = BackwardTimings::default();
         let mut clock = std::time::Instant::now();
         let mut lap = |t: &mut f32| {
@@ -548,9 +579,13 @@ impl GpuRasterizer {
         });
         lap(&mut t.alloc_ms);
 
+        let pipeline = match reduce {
+            ReduceMode::Direct => &self.backward_batch,
+            ReduceMode::Workgroup => &self.backward_batch_reduced,
+        };
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("backward_batch"),
-            layout: &self.backward_batch.get_bind_group_layout(0),
+            layout: &pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: packed.params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: packed.tris.as_entire_binding() },
@@ -569,7 +604,7 @@ impl GpuRasterizer {
                 label: Some("backward_batch"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.backward_batch);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(
                 p.width.div_ceil(8) as u32,
@@ -992,6 +1027,75 @@ mod tests {
         let p = RenderParams::new(16, 16, 0.02);
         assert!(gpu.render_many(&[], p).expect("empty").is_empty());
         assert!(gpu.backward_many(&[], p, &[]).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn reduce_modes_agree() {
+        // The two paths accumulate gradients by completely different means —
+        // one global atomic per pixel versus a workgroup reduction with
+        // barriers. Agreement is the check that the barrier restructuring did
+        // not drop or double-count a contribution.
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(40, 40, 0.02);
+        let scenes: Vec<Scene> = (0..4).map(|_| test_scene(10)).collect();
+        let targets: Vec<Canvas> =
+            (0..4).map(|i| Canvas::filled(40, 40, [0.2 + i as f32 * 0.1, 0.4, 0.6])).collect();
+
+        let (direct, _) =
+            gpu.backward_many_full(&scenes, p, &targets, ReduceMode::Direct).expect("direct");
+        let (reduced, _) =
+            gpu.backward_many_full(&scenes, p, &targets, ReduceMode::Workgroup).expect("workgroup");
+
+        for (i, ((la, ga), (lb, gb))) in direct.iter().zip(&reduced).enumerate() {
+            assert!((la - lb).abs() < 1e-9, "item {i} loss {la} vs {lb}");
+            let norm = ga.iter().map(|g| g * g).sum::<f32>().sqrt().max(1e-12);
+            let err = max_abs_diff(ga, gb) / norm;
+            assert!(err < 1e-3, "item {i} gradient error {err}");
+        }
+    }
+
+    #[test]
+    fn workgroup_reduction_matches_cpu() {
+        let Some(gpu) = gpu() else { return };
+        let p = RenderParams::new(48, 48, 0.02);
+        let scenes: Vec<Scene> = (0..3).map(|_| test_scene(12)).collect();
+        let targets: Vec<Canvas> =
+            (0..3).map(|_| Canvas::filled(48, 48, [0.5, 0.3, 0.7])).collect();
+
+        let (out, _) =
+            gpu.backward_many_full(&scenes, p, &targets, ReduceMode::Workgroup).expect("workgroup");
+
+        for (i, (loss, grads)) in out.iter().enumerate() {
+            let (rendered, tape) = render_with_tape(&scenes[i], p);
+            let (cpu_loss, cpu_grads) = cpu_backward(&scenes[i], p, &tape, &rendered, &targets[i]);
+            assert!((cpu_loss - loss).abs() < 1e-6, "item {i} loss");
+            let norm = cpu_grads.iter().map(|g| g * g).sum::<f32>().sqrt().max(1e-12);
+            assert!(max_abs_diff(&cpu_grads, grads) / norm < 1e-3, "item {i} gradients");
+        }
+    }
+
+    #[test]
+    fn workgroup_reduction_handles_non_multiple_sizes() {
+        // Exercises the awkward cases: a canvas whose dimensions are not a
+        // multiple of the 8x8 workgroup (so edge threads are inactive but must
+        // still reach every barrier), and a triangle count that is not a
+        // multiple of the 32-triangle chunk.
+        let Some(gpu) = gpu() else { return };
+        for (w, h, tris) in [(37usize, 19usize, 33usize), (8, 8, 1), (17, 41, 65)] {
+            let p = RenderParams::new(w, h, 0.02);
+            let scenes = vec![test_scene(tris)];
+            let targets = vec![Canvas::filled(w, h, [0.3, 0.5, 0.7])];
+
+            let (out, _) = gpu
+                .backward_many_full(&scenes, p, &targets, ReduceMode::Workgroup)
+                .expect("workgroup");
+
+            let (rendered, tape) = render_with_tape(&scenes[0], p);
+            let (_, cpu_grads) = cpu_backward(&scenes[0], p, &tape, &rendered, &targets[0]);
+            let norm = cpu_grads.iter().map(|g| g * g).sum::<f32>().sqrt().max(1e-12);
+            let err = max_abs_diff(&cpu_grads, &out[0].1) / norm;
+            assert!(err < 1e-3, "{w}x{h} with {tris} triangles: error {err}");
+        }
     }
 
     #[test]
