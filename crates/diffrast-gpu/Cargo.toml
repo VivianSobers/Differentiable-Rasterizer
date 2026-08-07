@@ -11,7 +11,6 @@ wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 rand = "0.8"
-rayon = "1.10"
 
 
 [[bin]]

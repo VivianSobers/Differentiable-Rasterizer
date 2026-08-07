@@ -196,7 +196,6 @@ dependencies = [
  "diffrast",
  "pollster",
  "rand",
- "rayon",
  "wgpu",
 ]
 
