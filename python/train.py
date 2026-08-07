@@ -12,18 +12,19 @@
 
 ## Where the time goes
 
-The rasterizer runs on CPU, so a naive end-to-end loop is bottlenecked by
-rendering and the GPUs idle. Two mitigations, both on by default:
+Rendering is the slow part of an end-to-end step. Three levers:
 
+- **`--raster-device`** selects the rasterizer's own backend. `auto` picks from
+  the measured crossover: the GPU only pulls ahead once there is enough geometry
+  to spread gradient-accumulator contention across, and below that a many-core
+  CPU parallelizing over batch items wins outright. This is separate from the
+  torch device — the extension carries its own wgpu context.
 - **Render loss on a sub-batch.** The photometric term is computed on a slice
   of each batch (`--render-fraction`), while the whole batch still gets the
   cheap GPU-side terms. The gradient is noisier per step but steps are far
   faster, which wins comfortably.
-- **`--pretrain`**, which trains against precomputed fits — pure GPU work, no
-  rasterizer in the loop at all. Use it to get most of the way, then fine-tune
-  end-to-end.
-
-A GPU rasterizer would remove this constraint entirely; see the roadmap.
+- **`--pretrain`**, which trains against precomputed fits — no rasterizer in the
+  loop at all. Use it to get most of the way, then fine-tune end-to-end.
 """
 
 from __future__ import annotations
@@ -116,10 +117,17 @@ def train_step(
         metrics["param_loss"] = param_loss.item()
 
     if args.render_weight > 0:
-        # Render only a slice: the rasterizer is on CPU and is the slowest part
-        # of the step by a wide margin.
+        # Render only a slice: rendering dominates the step even on the GPU
+        # path, and a noisier photometric gradient is a good trade for
+        # substantially cheaper steps.
         n = max(1, int(len(images) * args.render_fraction))
-        rendered = rasterize(predicted[:n], images.shape[-2], images.shape[-1], sigma=sigma)
+        rendered = rasterize(
+            predicted[:n],
+            images.shape[-2],
+            images.shape[-1],
+            sigma=sigma,
+            device=args.raster_device,
+        )
         render_loss = F.mse_loss(rendered, images[:n])
         loss = loss + args.render_weight * render_loss
         metrics["render_loss"] = render_loss.item()
@@ -284,6 +292,12 @@ def parse_args() -> argparse.Namespace:
         help="share of each batch that gets the (CPU-bound) render loss",
     )
     p.add_argument("--param-weight", type=float, default=1.0)
+    p.add_argument(
+        "--raster-device",
+        default="auto",
+        choices=["auto", "cpu", "gpu"],
+        help="backend for the rasterizer itself, independent of the torch device",
+    )
 
     args = p.parse_args()
     if not 0 < args.render_fraction <= 1:
