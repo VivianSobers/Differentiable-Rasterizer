@@ -146,18 +146,18 @@ random start.
 
 | 40 refinement steps, 48px | from prediction | from random |
 | --- | --- | --- |
-| `pool=1` | 24.44 dB | 23.49 dB |
-| `pool=4` | **24.62 dB** | 23.49 dB |
+| `pool=1` | 24.33 dB | 23.49 dB |
+| `pool=4` | **24.84 dB** | 23.49 dB |
 
-A random start needs **16 steps** to reach what `pool=4` produces with none, up
-from 12 for `pool=1` — a better model is worth more iterations skipped, which
-is the metric behaving as intended.
+A random start needs **16 steps** to reach what either model produces with
+none. That is the amortization claim holding, if modestly: one forward pass is
+worth about 16 fitting iterations here.
 
-Worth noting honestly: refinement washes most of the difference out. `pool=4`
-starts 1.58 dB ahead one-shot and finishes only 0.18 dB ahead after 40 steps.
-The head start is real but the fitter is good enough to mostly catch up, so
-the value of a better model is in the iterations saved rather than in the final
-quality reached.
+Worth noting honestly: refinement compresses the difference between the two
+arms. They start 0.09 dB apart one-shot and finish 0.51 dB apart after 40
+steps, both far below the 27.5 dB a longer direct fit reaches. The head start
+is real, and it is small — the value of a better model is in iterations saved,
+not in the final quality reached.
 
 ## What is still wrong
 

@@ -119,14 +119,22 @@ comparing against a flat per-image colour fill:
 python python/evaluate.py --checkpoint runs/amortized/best.pt --synthetic --refine-steps 40
 ```
 
-The first honest measurement had the model **losing to the flat colour fill**,
-with only 0.83 dB of its score attributable to reading its input at all. The
-cause was `AdaptiveAvgPool2d(1)` before the head: global average pooling is
-invariant to spatial permutation, and for a task that is almost entirely about
-*where* triangles go, it discarded exactly the signal the head needed. Pooling
-to 4x4 instead — same resolution-agnosticism, coarse layout kept — took input
-gain to **3.41 dB** on an identical budget. [docs/AMORTIZED.md](docs/AMORTIZED.md)
-has the full comparison, including what is still wrong with it.
+The first honest measurement had the model **losing to the flat colour fill**.
+Diagnosing why took two attempts. The first blamed `AdaptiveAvgPool2d(1)`
+before the head — global average pooling is invariant to spatial permutation,
+which for a task that is almost entirely about *where* triangles go discards
+the signal the head needs. That is a real defect, and it is not what was doing
+the damage: `--render-fraction` defaulted to 0.25, which with no parameter
+supervision meant 75% of every batch contributed nothing to any loss. Fixing
+the default moved the weaker architecture's input gain from 0.83 dB to 3.51 dB
+on its own.
+
+What the pooling actually governs is capacity. Asked to memorize 16 images,
+`pool=4` reaches 27.07 dB against the 27.47 dB a direct fit achieves — it
+matches the optimizer it is imitating — while `pool=1` stalls 2.3 dB short. So
+the model can produce scenes this good; it cannot yet produce the *right* one
+for an image it has not seen. [docs/AMORTIZED.md](docs/AMORTIZED.md) has both
+measurements and the correction.
 
 ## Benchmarks
 
