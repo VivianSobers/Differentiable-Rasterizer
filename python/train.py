@@ -166,7 +166,7 @@ def main() -> int:
         persistent_workers=args.workers > 0,
     )
 
-    model = TriangleNet(triangles=triangles, width=args.width).to(device)
+    model = TriangleNet(triangles=triangles, width=args.width, pool=args.pool).to(device)
     if is_main:
         print(f"model: {count_parameters(model):,} parameters, {triangles} triangles")
         print(f"data:  {len(dataset):,} items, batch {args.batch} x {world_size} rank(s)")
@@ -244,6 +244,7 @@ def main() -> int:
                 "model": state,
                 "triangles": triangles,
                 "width": args.width,
+                "pool": args.pool,
                 "epoch": epoch,
                 "args": vars(args),
             }
@@ -271,6 +272,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--triangles", type=int, default=128)
     p.add_argument("--size", type=int, default=64, help="training resolution")
     p.add_argument("--width", type=int, default=32, help="model channel width")
+    p.add_argument(
+        "--pool",
+        type=int,
+        default=4,
+        help="adaptive pool side before the head; 1 discards spatial layout",
+    )
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
