@@ -89,11 +89,14 @@ torch device: the extension carries its own wgpu context, and tensors always
 cross the boundary as CPU float32.
 
 `auto` picks from the measured crossover rather than assuming the GPU is
-faster — it is not, below roughly 64 triangles, where there are too few
-gradient accumulators to spread contention across and a many-core CPU
-parallelizing over batch items wins outright. `last_device()` reports what a
-call actually used, which is worth checking: an earlier version of the binding
-parsed `device` and silently ignored it, and timings alone did not reveal it.
+faster. On a discrete card it now is, at every size benchmarked; on an
+integrated one it is not, at any size benchmarked, so the rule branches on the
+adapter kind rather than pretending one threshold covers both.
+
+`last_device()` reports what a call actually used, which is worth checking: an
+earlier version of the binding parsed `device` and silently ignored it, and
+timings alone did not reveal it. `policy_prefers_gpu()` answers the same
+question ahead of time.
 
 Training is still staged so the GPUs are never idle: `precompute.py` fits a
 corpus once in parallel across cores, and `train.py --pretrain` trains on those
@@ -144,33 +147,33 @@ Measured on an **RTX 4090** against a 26-core i9-13900. (Reproduce with
 
 | Forward | CPU (26 cores) | RTX 4090 | Speedup |
 | --- | --- | --- | --- |
-| 128x128, 64 triangles | 0.51 ms | 0.14 ms | 3.7x |
-| 256x256, 128 triangles | 3.46 ms | 0.20 ms | 17.0x |
-| 512x512, 256 triangles | 25.6 ms | 0.76 ms | 33.8x |
-| 512x512, 1024 triangles | 96.4 ms | 1.36 ms | **71x** |
+| 128x128, 64 triangles | 0.52 ms | 0.11 ms | 4.7x |
+| 256x256, 128 triangles | 3.53 ms | 0.26 ms | 13.6x |
+| 512x512, 256 triangles | 24.5 ms | 0.66 ms | 37.0x |
+| 512x512, 1024 triangles | 96.5 ms | 1.38 ms | **70x** |
 
 | Forward + backward | CPU (26 cores) | RTX 4090 | Speedup |
 | --- | --- | --- | --- |
-| 128x128, 64 triangles | 2.81 ms | 2.13 ms | 1.3x |
-| 256x256, 128 triangles | 23.2 ms | 16.9 ms | 1.4x |
-| 256x256, 512 triangles | 87.8 ms | 20.4 ms | **4.3x** |
+| 128x128, 64 triangles | 2.70 ms | 2.22 ms | 1.2x |
+| 256x256, 128 triangles | 21.1 ms | 17.3 ms | 1.2x |
+| 256x256, 512 triangles | 88.5 ms | 18.8 ms | **4.7x** |
 
 The speedup keeps growing with load and has not saturated at 1024 triangles,
 which says the device is still being fed rather than waiting.
 
 The most informative number is not a speedup at all. Going from 128 to 512
-triangles at fixed resolution — 4x the geometry — costs the CPU **3.9x** more
-time and the GPU **1.08x**:
+triangles at fixed resolution — 4x the geometry — costs the CPU **4.2x** more
+time and the GPU **1.09x**:
 
 | 256x256 | 128 triangles | 512 triangles | Cost of 4x geometry |
 | --- | --- | --- | --- |
-| CPU | 23.2 ms | 87.8 ms | 3.79x |
-| GPU | 16.9 ms | 20.4 ms | **1.21x** |
+| CPU | 21.1 ms | 88.5 ms | 4.19x |
+| GPU | 17.3 ms | 18.8 ms | **1.09x** |
 
-The GPU absorbs four times the geometry almost for free, because at these sizes
-the backward pass is bound by fixed overhead — buffer upload and readback — not
-by arithmetic. That is the thing to attack next, and it is a very different
-problem from the one the profile suggested on weaker hardware.
+The GPU absorbs four times the geometry almost for free, because these are
+single unbatched calls and fixed per-call overhead swamps the arithmetic. That
+observation is what the rest of this section is about: the overhead turned out
+to be three separate things, only one of which was the one it looked like.
 
 ### Two backward implementations
 
@@ -180,8 +183,8 @@ there are two implementations, and `Recompute` is the default:
 
 | Mode | Compute | Memory | 4090, 256px, 512 tris |
 | --- | --- | --- | --- |
-| `Taped` | O(T) | O(T x pixels) | 30.2 ms |
-| `Recompute` | O(T²) | none | **20.4 ms** |
+| `Taped` | O(T) | O(T x pixels) | 27.5 ms |
+| `Recompute` | O(T²) | none | **18.8 ms** |
 
 `Recompute` re-derives the canvas beneath each triangle rather than storing it,
 and wins despite doing quadratically more arithmetic — the bounding-box cull
@@ -198,20 +201,19 @@ dispatching one at a time:
 
 | batch of 64, 128px, 64 tris | CPU rayon (26 cores) | GPU one-by-one | GPU batched |
 | --- | --- | --- | --- |
-| worker-2 | 21.2 ms | 131.0 ms | **16.2 ms** |
+| worker-2, at the time | 21.5 ms | 135.0 ms | **45.4 ms** |
 
-This row is worth keeping the history of, because it inverted. Before the
-workgroup reduction the batched GPU took **45.4 ms** here — 3x better than
-one-by-one and still **2x worse than the CPU**. At small per-item work 26 cores
-parallelize across batch items nearly perfectly, while the GPU paid upload and
-readback for a workload too small to amortize them.
+Batching was 3x better than not batching and still **2x worse than the CPU**.
+At small per-item work 26 cores parallelize across batch items nearly
+perfectly, while the GPU paid upload and readback for a workload too small to
+amortize them.
 
-That measurement is the reason the PyTorch layer was never routed to the GPU
-unconditionally, and it was the right call at the time. Fixing the contention
-(below) moved the line rather than erasing it: the GPU now takes this row by
-1.3x, but a CPU-wins region still exists at low triangle counts. `gpu_bench`
-ends with a crossover table so the dispatch rule stays read off measured data
-instead of off an assumption that aged badly once already.
+That measurement is why the PyTorch layer was never routed to the GPU
+unconditionally, and it was the right call on the evidence available. It is
+also no longer true — the same row now reads 5.0 ms, and
+[the final crossover](#the-crossover-finally) has the GPU ahead everywhere on
+that card. `gpu_bench` ends with a crossover table precisely so the dispatch
+rule tracks the hardware instead of a conclusion that has now aged out twice.
 
 ### The crossover, and what it exposed
 
@@ -298,19 +300,25 @@ Speedup over the previous path, batch of 16, on an idle 4090:
 
 | | 32 triangles | 128 triangles | 512 triangles |
 | --- | --- | --- | --- |
-| **64x64** | 1.53x | 1.69x | 1.14x |
-| **128x128** | 2.26x | 2.89x | 1.85x |
-| **256x256** | **6.59x** | 5.19x | 3.31x |
+| **64x64** | 1.96x | 1.69x | 1.21x |
+| **128x128** | 4.49x | 3.41x | 2.04x |
+| **256x256** | **21.5x** | 10.4x | 3.96x |
+
+(Measured after the overhead work below. The 256px figures were 6.59x, 5.19x
+and 3.31x when both paths still carried ~11 ms of fixed allocation and
+transfer; removing a constant from both sides of a ratio inflates it, and the
+later numbers flatter the reduction for a reason that has nothing to do with
+the reduction.)
 
 The *shape* of that table is the real result. Contention theory predicts the win
 grows with pixel count (more threads queuing) and shrinks with triangle count
 (more accumulator slots to spread across).
 
-The pixel axis holds cleanly — every column rises monotonically, by 4.3x, 3.1x
-and 2.9x from top to bottom. The triangle axis holds at 256px (6.59x → 3.31x)
-and is inside the noise on the two smaller canvases, where the whole call is
-under 8 ms and dominated by transfer. On an integrated AMD card, where every
-cell is compute-bound, both axes hold monotonically in all nine.
+Both axes hold monotonically in all nine cells: every column rises with
+resolution, every row falls with triangle count. That is as clean a
+confirmation as a prediction of this kind gets — and it got *cleaner* once the
+overhead work below stopped fixed transfer costs from masking the trend on the
+smaller canvases.
 
 And the anomaly that started this is gone. Dispatch scaling per 4x pixels was
 **12.6x**; it is now **2.4-3.1x** — linear or better, which is what
@@ -343,7 +351,8 @@ was right. At 512 triangles the GPU's margin used to *shrink* as resolution grew
 stopped being the thing that hurt.
 
 What survives is a real CPU-wins column at 32 triangles. That one is not
-contention.
+contention — see [what was left](#what-is-left-now-that-it-is-not-the-atomics),
+which is where it goes.
 
 ### What is left, now that it is not the atomics
 
@@ -387,29 +396,75 @@ per batch item, so the rendered batch never leaves the device. Previously the
 host read back 12.6 MB in order to produce 16 floats. Gradients and losses are
 then fetched in a single mapped readback rather than two.
 
-On the integrated AMD card, batch of 16 at 256px:
+On the 4090, batch of 16 at 256px:
 
-| phase | before | after |
-| --- | --- | --- |
-| alloc | 5.06 ms | 2.48 ms |
-| readback | 5.98 ms | 1.73 ms |
-| loss | 2.18 ms | **0.01 ms** |
-| **overhead total** | **13.22 ms** | **4.22 ms** |
+| phase | before | after | |
+| --- | --- | --- | --- |
+| pack | 0.03 ms | 0.02 ms | |
+| alloc | 5.85 ms | 1.19 ms | 4.9x |
+| dispatch | 1.95 ms | 1.96 ms | unchanged, as intended |
+| readback | 4.34 ms | 0.03 ms | **145x** |
+| loss | 0.87 ms | 0.00 ms | now on the device |
+| **total** | **13.04 ms** | **3.20 ms** | **4.1x** |
 
-A **3.1x** cut in everything that is not dispatch. Total call time only improves
-12% there, because on that card dispatch is 40 of 46 ms and dominates
-regardless.
+Everything that is not dispatch fell from 11.06 ms to 1.24 ms — **8.9x**. The
+call is now 61% dispatch, which is what it should have been all along.
 
-The 4090 is the opposite shape — 11.06 ms of overhead against 1.95 ms of
-dispatch — so the same 3x should matter far more, and predicts the 32-triangle
-column flipping to the GPU. **That is a prediction, not a measurement.** Two
-earlier predictions in this file were wrong in exactly this spot, so it stays
-labelled as one until `collect-gpu-report.sh` runs on the 4090.
+I predicted 3x here and got 8.9x, so the prediction was right in direction and
+wrong in size — the two effects compound, because pooling also removes the
+staging buffer that the readback would have allocated.
+
+The same change is worth only 12% on the integrated card, where dispatch is 40
+of 46 ms and dominates regardless. Overhead work pays off in proportion to how
+little of the time is real work.
 
 Reuse is asserted rather than assumed: `buffers_are_reused_across_identical_calls`
-checks that a repeated call allocates *nothing* and returns bit-identical
-gradients. A pool that silently never hit would be invisible in a timing, and
-`pool_stats()` exists so the test can look instead of infer.
+checks that a repeated call allocates *nothing*. A pool that silently never hit
+would be invisible in a timing, and `pool_stats()` exists so the test can look
+instead of infer. Across a full `gpu_bench` run it reports 1745 hits to 31
+misses.
+
+That test also found something I had asserted without checking. It originally
+required the two calls to return *bit-identical* gradients, which passed on an
+integrated card and failed on the 4090 — by one ULP, on one value in sixty.
+**The GPU backward pass is not bit-reproducible**, and cannot be: each
+workgroup adds its partial into a triangle's accumulator through a global
+atomic, the scheduler picks the order, and float addition is not associative. A
+4090's 128 SMs reorder enough to show it where 12 compute units did not. The
+test now uses a tolerance four orders of magnitude tighter than the defect it
+guards — a buffer reused without clearing comes back doubled, not different in
+the last bit.
+
+### The crossover, finally
+
+Batch of 16, idle 4090 vs 26 CPU cores, after all three changes:
+
+| | 32 triangles | 128 triangles | 512 triangles |
+| --- | --- | --- | --- |
+| **64x64** | **1.85x** | **1.70x** | **2.26x** |
+| **128x128** | **4.06x** | **4.96x** | **3.89x** |
+| **256x256** | **3.64x** | **6.03x** | **3.89x** |
+
+Every cell, including the 32-triangle column that the CPU won twice. At 256x256
+with 32 triangles the GPU has gone 0.12x → 0.79x → **3.64x** across the three
+rounds of this investigation, without the shader's arithmetic changing at all.
+
+The batched backward pass moved with it — same work, one dispatch instead of N:
+
+| batch of 64, 128px, 64 tris | CPU rayon | GPU one-by-one | GPU batched |
+| --- | --- | --- | --- |
+| before | 21.5 ms | 135.0 ms | 45.4 ms |
+| now | 20.8 ms | 179.3 ms | **5.0 ms** |
+
+9x on the batched path, and the gap over dispatching one at a time went 3x →
+**35.8x**, because per-call overhead is exactly what was removed.
+
+**This is one machine.** The same benchmark on an integrated AMD part has the
+CPU winning all nine cells by 2-3x, and that is not a constant to fold into one
+threshold — an integrated GPU is competing for the memory bandwidth of the
+cores it is racing. `device="auto"` therefore branches on whether the adapter
+is discrete, with both measured tables pinned in
+`test_policy_matches_the_discrete_crossover` and its integrated twin.
 
 ### The general lesson
 
@@ -451,7 +506,7 @@ the 28x without any indication of why.
 
 An earlier revision of this file reported, from an integrated AMD Radeon 860M,
 that the GPU backward pass was *slower* than the CPU and needed a tiled-binning
-rewrite. On the 4090 it is 1.3-4.3x faster and binning is no longer the
+rewrite. On the 4090 it is 1.2-4.7x faster and binning is no longer the
 bottleneck. The integrated result was real, but it generalized badly: a GPU
 sharing system memory with the CPU is close to the worst case for this workload.
 The conclusion changed because the measurement changed, which is the argument
@@ -509,13 +564,11 @@ sigma a fit ends on.
 
 ## Roadmap
 
-- **Re-measure on the 4090.** Pooling and the device-side loss are measured on
-  an integrated card only; the prediction that they flip the 32-triangle column
-  is unverified, and the `auto` thresholds should be re-derived from whatever
-  the new crossover says.
 - **Tiled binning.** Per-tile triangle lists would stop the shader visiting
-  every (pixel, triangle) pair. Lower priority — the 4090 rejects culled pairs
-  almost for free, and dispatch is now 15% of the call.
+  every (pixel, triangle) pair. Now the *only* remaining lever: dispatch is
+  61% of a backward call, up from 15%, purely because everything around it got
+  cheaper. The 4090 still rejects culled pairs almost for free, so the win
+  would come from the `O(T²)` recompute rather than from the culling.
 - **Gaussian primitives** alongside triangles, closer to how 3D Gaussian
   splatting parameterizes scenes.
 - **Perceptual loss** (LPIPS) in place of MSE, which over-rewards blur.
