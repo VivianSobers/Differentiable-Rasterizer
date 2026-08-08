@@ -4,7 +4,8 @@ Everything here is meant to be run on your machines — I have no access to them
 so these are instructions rather than something already executed.
 
 Baseline established 2026-08-06 on an RTX 4090 + 26-core i9-13900: forward is up
-to **71x** faster than the CPU, forward+backward up to **4.7x**. Raw output is in
+to **70x** faster than the CPU, and after three rounds of optimization the
+batched backward pass wins every cell of the crossover. Raw output is in
 `docs/gpu-report.txt`; the README discusses what it means.
 
 ## 0. One-time setup, both boxes
@@ -16,14 +17,14 @@ cd Differentiable-Rasterizer
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 
-cargo test --release                 # expect 72 passing
+cargo test --release                 # expect 86 passing
 cargo run --release --bin gpu_bench  # confirms the GPU path sees the 4090
 
 python -m venv .venv && . .venv/bin/activate
 pip install -r python/requirements.txt maturin torch
 (cd crates/diffrast-py && maturin develop --release)
 
-python -m unittest discover -s python -p "test_*.py"   # expect 43 passing
+python -m unittest discover -s python -p "test_*.py"   # expect 61 passing
 ```
 
 If `gpu_bench` reports a Vulkan adapter that is not the 4090, force it:
@@ -112,12 +113,14 @@ After the supervised warm start, fine-tune through the rasterizer:
 ```sh
 torchrun --nproc_per_node=2 python/train.py \
   --data /path/to/images --epochs 20 \
-  --render-fraction 0.5 --param-weight 0 \
+  --param-weight 0 --raster-device auto \
   --out runs/finetune
 ```
 
-This stage is CPU-bound today, because the PyO3 layer calls the CPU rasterizer.
-Raise `--workers` and lower `--render-fraction` if the GPUs are idling.
+`--param-weight 0` removes the parameter-supervision term, which means the
+render loss is the only loss — so leave `--render-fraction` at its default of
+1.0 here. Lowering it would discard batch outright rather than trade accuracy
+for speed. Raise `--workers` if the cards are idling waiting on data.
 
 ## 3. A suggested division of labor
 
