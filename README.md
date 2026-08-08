@@ -52,6 +52,7 @@ crates/diffrast-py/     PyO3 bindings — the rasterizer as a torch op
 crates/diffrast-wasm/   WebAssembly bindings
 python/diffrast/        Torch layer, model, datasets, plots
 python/train.py         Distributed training
+python/evaluate.py      Amortized model evaluation, with controls
 web/                    TypeScript viewer
 ```
 
@@ -106,6 +107,26 @@ The parameter-supervision term is deliberately decayed to zero over training.
 Many different triangle sets render to the same image, so matching a particular
 fit is a weaker signal than matching its output — useful as a warm start,
 misleading as an objective.
+
+**A falling loss here is not evidence the model works**, which took a while to
+appreciate. A network that ignored its input and emitted one generic scene
+still drives the render loss down, because a mid-grey blob scores respectably
+against almost any target. `evaluate.py` adds the controls that separate the
+two — chiefly scoring each prediction against somebody else's target, and
+comparing against a flat per-image colour fill:
+
+```sh
+python python/evaluate.py --checkpoint runs/amortized/best.pt --synthetic --refine-steps 40
+```
+
+The first honest measurement had the model **losing to the flat colour fill**,
+with only 0.83 dB of its score attributable to reading its input at all. The
+cause was `AdaptiveAvgPool2d(1)` before the head: global average pooling is
+invariant to spatial permutation, and for a task that is almost entirely about
+*where* triangles go, it discarded exactly the signal the head needed. Pooling
+to 4x4 instead — same resolution-agnosticism, coarse layout kept — took input
+gain to **3.41 dB** on an identical budget. [docs/AMORTIZED.md](docs/AMORTIZED.md)
+has the full comparison, including what is still wrong with it.
 
 ## Benchmarks
 
@@ -520,7 +541,7 @@ having compiled the same WGSL through entirely different toolchains.
 
 ```sh
 cargo test --release          # 86 Rust tests
-python -m unittest discover -s python -p "test_*.py"   # 51 Python tests
+python -m unittest discover -s python -p "test_*.py"   # 61 Python tests
 cargo clippy --all-targets    # clean
 cargo fmt --all -- --check
 ```
