@@ -1436,9 +1436,24 @@ mod tests {
         // Reuse must not leak state between calls — the gradient accumulator
         // is the one that is added into rather than overwritten, so a missing
         // clear would double it here.
+        //
+        // Compared with a tolerance rather than exactly, because **the GPU
+        // backward pass is not bit-reproducible**. Each workgroup adds its
+        // partial into a triangle's accumulator with a global atomic, and the
+        // order those land in is whatever the scheduler chooses; float
+        // addition is not associative, so the sum moves by an ULP or two
+        // between runs. A 4090 with 128 SMs reorders enough for this to show,
+        // where an integrated card with far fewer did not — the assertion
+        // passed locally and failed there.
+        //
+        // The tolerance is still far tighter than the defect it guards: a
+        // buffer that was reused without clearing would come back roughly
+        // doubled, not different in the last bit.
         for (a, b) in first.iter().zip(&second) {
             assert!((a.0 - b.0).abs() < 1e-9, "loss changed on reuse: {} vs {}", a.0, b.0);
-            assert_eq!(a.1, b.1, "gradients changed when buffers were reused");
+            let norm = a.1.iter().map(|g| g * g).sum::<f32>().sqrt().max(1e-12);
+            let err = max_abs_diff(&a.1, &b.1) / norm;
+            assert!(err < 1e-4, "gradients changed by {err} when buffers were reused");
         }
 
         gpu.clear_pool();
