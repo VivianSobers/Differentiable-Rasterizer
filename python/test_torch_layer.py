@@ -230,52 +230,75 @@ class TestFusedLoss(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_TORCH, "torch or diffrast_rs not installed")
 class TestDispatchPolicy(unittest.TestCase):
-    """Pin `device="auto"` to the crossover it claims to be derived from.
+    """Pin `device="auto"` to the crossovers it claims to be derived from.
 
-    The table is `gpu_bench`'s crossover on an idle RTX 4090 against a 26-core
-    i9-13900, batch of 16, as recorded in `docs/gpu-report.txt`. Values are
-    GPU-over-CPU speedups: above 1.0 the GPU won. Cells inside +/-10% are
-    genuine ties and are not asserted on — either choice is defensible there,
-    and pinning a tie would make the test fail on noise rather than on a
-    regression.
+    Two tables, because discrete and integrated GPUs measure as different
+    regimes rather than one scaled by a constant. Both are `gpu_bench`'s
+    crossover at batch 16 against a 26-core i9-13900, as recorded in
+    `docs/gpu-report.txt`. Values are GPU-over-CPU speedups: above 1.0 the GPU
+    won. Cells inside +/-10% are ties and are skipped, so noise cannot fail
+    this.
 
     This runs without a GPU, which is the point: it checks the *rule*, not the
     hardware. `test_device_routing_is_honoured` covers the rule being obeyed.
     """
 
-    MEASURED = [
+    # RTX 4090. Every cell favours the GPU, including the 32-triangle column
+    # that the CPU used to win before the workgroup reduction, buffer pooling
+    # and the device-side loss reduction landed.
+    DISCRETE = [
         # (pixels, triangles, gpu speedup over cpu)
-        (64 * 64, 32, 0.83),
-        (64 * 64, 128, 2.04),
-        (64 * 64, 512, 2.37),
-        (128 * 128, 32, 1.02),
-        (128 * 128, 128, 3.61),
-        (128 * 128, 512, 3.52),
-        (256 * 256, 32, 0.79),
-        (256 * 256, 128, 2.41),
-        (256 * 256, 512, 3.38),
+        (64 * 64, 32, 1.85),
+        (64 * 64, 128, 1.70),
+        (64 * 64, 512, 2.26),
+        (128 * 128, 32, 4.06),
+        (128 * 128, 128, 4.96),
+        (128 * 128, 512, 3.89),
+        (256 * 256, 32, 3.64),
+        (256 * 256, 128, 6.03),
+        (256 * 256, 512, 3.89),
     ]
 
-    def test_policy_matches_the_measured_crossover(self) -> None:
-        for pixels, tris, speedup in self.MEASURED:
+    # Integrated AMD 860M. Every cell favours the CPU — an integrated part
+    # competes for the same memory bandwidth as the cores it is racing.
+    INTEGRATED = [
+        (64 * 64, 32, 0.60),
+        (64 * 64, 128, 0.43),
+        (64 * 64, 512, 0.43),
+        (128 * 128, 32, 0.51),
+        (128 * 128, 128, 0.39),
+        (128 * 128, 512, 0.34),
+        (256 * 256, 32, 0.31),
+        (256 * 256, 128, 0.33),
+        (256 * 256, 512, 0.35),
+    ]
+
+    def check(self, table, discrete: bool) -> None:
+        for pixels, tris, speedup in table:
             if 0.9 <= speedup <= 1.1:
                 continue
-            with self.subTest(pixels=pixels, triangles=tris):
+            with self.subTest(pixels=pixels, triangles=tris, discrete=discrete):
                 self.assertEqual(
-                    policy_prefers_gpu(16, tris, pixels),
+                    policy_prefers_gpu(16, tris, pixels, discrete),
                     speedup > 1.0,
                     f"{tris} tris at {pixels} px measured {speedup:.2f}x",
                 )
 
-    def test_tiny_batches_stay_on_the_cpu(self) -> None:
+    def test_policy_matches_the_discrete_crossover(self) -> None:
+        self.check(self.DISCRETE, discrete=True)
+
+    def test_policy_matches_the_integrated_crossover(self) -> None:
+        self.check(self.INTEGRATED, discrete=False)
+
+    def test_single_images_stay_on_the_cpu(self) -> None:
         # One image cannot amortize a dispatch no matter how much geometry it
         # carries; batching is the whole reason the GPU path exists.
-        self.assertFalse(policy_prefers_gpu(1, 512, 256 * 256))
-        self.assertTrue(policy_prefers_gpu(16, 512, 256 * 256))
+        self.assertFalse(policy_prefers_gpu(1, 512, 256 * 256, True))
+        self.assertTrue(policy_prefers_gpu(16, 512, 256 * 256, True))
 
     def test_trivial_workloads_stay_on_the_cpu(self) -> None:
         # Below the floor the fixed overhead dominates whatever it saves.
-        self.assertFalse(policy_prefers_gpu(4, 64, 16 * 16))
+        self.assertFalse(policy_prefers_gpu(4, 8, 16 * 16, True))
 
 
 @unittest.skipUnless(HAVE_TORCH, "torch or diffrast_rs not installed")
