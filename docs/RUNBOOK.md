@@ -152,21 +152,29 @@ Three things, in order of usefulness:
 
    ```sh
    python python/train.py --synthetic --epochs 60 --synthetic-size 40000 \
-       --batch 64 --triangles 64 --size 96 --width 32 --pool 4 \
-       --raster-device auto --out runs/pool4
+       --batch 64 --triangles 64 --size 96 --width 48 --pool 4 \
+       --render-fraction 1.0 --raster-device auto --out runs/pool4
 
    python python/evaluate.py --checkpoint runs/pool4/best.pt --synthetic \
        --count 256 --refine-steps 100 --out runs/pool4/eval.json
    ```
 
-   The numbers to read are `input gain` and whether one-shot PSNR clears the
-   mean-colour baseline. On the small local run they were 3.41 dB and *no* —
-   the model still lost to a flat colour fill by 0.30 dB. Whether that is the
-   budget or the architecture is the open question, and 40k scenes at 96px
-   answers it.
+   `--render-fraction 1.0` is now the default without `--pretrain`, but pass it
+   explicitly — an earlier default of 0.25 discarded three quarters of every
+   batch here and invalidated a local experiment before it was caught.
 
-   Worth running the `--pool 1` arm too if there is spare time: the local
-   comparison used a model small enough that the conclusion deserves
-   confirmation at scale.
+   **The two numbers to read** are `input gain` and whether one-shot PSNR
+   clears the mean-colour baseline. Locally they were 3.62 dB and *no*, losing
+   by 0.17 dB. The capacity test says this is a generalization gap rather than
+   a representational limit — the same model memorizes 16 images to within
+   0.4 dB of what a direct fit achieves — so more data at higher resolution is
+   the treatment, and this run is the test of it.
+
+   Read the result against **27.5 dB**, not against perfection: that is what a
+   long direct fit reaches on this data, and no predictor should be expected to
+   beat the optimizer it is imitating.
+
+   The `--pool 1` arm is optional and lower value now. It costs the same run
+   again to confirm a 2.3 dB capacity gap already measured locally.
 3. Peak GPU memory during training (`nvidia-smi` during a run) — tells us how
    much headroom there is for larger batches or more triangles.
