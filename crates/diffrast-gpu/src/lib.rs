@@ -202,6 +202,7 @@ pub struct GpuRasterizer {
     backward_batch_reduced: wgpu::ComputePipeline,
     loss_batch: wgpu::ComputePipeline,
     pool: Mutex<BufferPool>,
+    discrete: bool,
     info: String,
 }
 
@@ -246,6 +247,7 @@ impl GpuRasterizer {
 
         let adapter_info = adapter.get_info();
         let info = format!("{} ({:?})", adapter_info.name, adapter_info.backend);
+        let discrete = adapter_info.device_type == wgpu::DeviceType::DiscreteGpu;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -311,6 +313,7 @@ impl GpuRasterizer {
             backward_batch_reduced,
             loss_batch,
             pool: Mutex::new(BufferPool::default()),
+            discrete,
             info,
         })
     }
@@ -370,6 +373,17 @@ impl GpuRasterizer {
     /// Human-readable description of the adapter in use.
     pub fn adapter_info(&self) -> &str {
         &self.info
+    }
+
+    /// Whether this is a discrete card rather than an integrated one.
+    ///
+    /// Worth distinguishing, because the two behave qualitatively differently
+    /// on this workload and not merely by a constant. An integrated part
+    /// shares memory bandwidth with the CPU it is competing against, so the
+    /// batched backward pass loses to 26 cores at every size measured; a 4090
+    /// wins at every size measured. A single threshold cannot describe both.
+    pub fn is_discrete(&self) -> bool {
+        self.discrete
     }
 
     /// Bytes the tape needs for a given workload — worth checking before a
