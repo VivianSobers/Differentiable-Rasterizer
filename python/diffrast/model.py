@@ -49,6 +49,8 @@ class TriangleNet(nn.Module):
         vertex_range: how far outside the canvas a vertex may land. Triangles
             clipped by the frame edge are legitimate and common, so the head
             must be able to express them.
+        pool: side length of the adaptive pool before the head. See below —
+            this is the single most consequential choice in the architecture.
     """
 
     def __init__(
@@ -57,13 +59,17 @@ class TriangleNet(nn.Module):
         width: int = 32,
         vertex_range: float = 0.15,
         in_channels: int = 3,
+        pool: int = 4,
     ) -> None:
         super().__init__()
         if triangles <= 0:
             raise ValueError("triangles must be positive")
+        if pool <= 0:
+            raise ValueError("pool must be positive")
 
         self.triangles = triangles
         self.vertex_range = vertex_range
+        self.pool_size = pool
 
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, width, 3, padding=1, bias=False),
@@ -78,11 +84,24 @@ class TriangleNet(nn.Module):
         )
         # Adaptive pooling makes the model resolution-agnostic: it can be
         # trained at 64px and run at 256px without reshaping the head.
-        self.pool = nn.AdaptiveAvgPool2d(1)
+        #
+        # The size matters enormously, and pooling to 1x1 — the obvious choice,
+        # and what this was — is close to the worst possible one *for this
+        # task*. Global average pooling is invariant to spatial permutation: it
+        # reports how much of each feature is present anywhere in the image and
+        # discards where. Inverse graphics is almost entirely a question of
+        # where, so that bottleneck throws away the signal the head needs and
+        # keeps the one it needs least.
+        #
+        # A 4x4 pool keeps the resolution-agnosticism that motivated pooling in
+        # the first place while preserving coarse layout. `pool=1` is kept so
+        # the two can be compared rather than argued about; see
+        # `docs/AMORTIZED.md` for what that comparison found.
+        self.pool = nn.AdaptiveAvgPool2d(pool)
 
         hidden = max(512, triangles * 4)
         self.head = nn.Sequential(
-            nn.Linear(width * 8, hidden),
+            nn.Linear(width * 8 * pool * pool, hidden),
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.SiLU(),
