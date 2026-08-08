@@ -122,13 +122,19 @@ def last_device() -> str:
     return diffrast_rs.last_device()
 
 
-def policy_prefers_gpu(batch: int, triangles: int, pixels: int) -> bool:
+def policy_prefers_gpu(
+    batch: int, triangles: int, pixels: int, discrete: bool | None = None
+) -> bool:
     """Whether `device="auto"`'s size rule favours the GPU for this shape.
 
     The size rule only — `auto` also requires an adapter. Useful for answering
     "why did auto pick the CPU here?" without timing anything.
+
+    The rule differs for discrete and integrated GPUs, which measure as
+    genuinely different regimes rather than the same one scaled. `discrete`
+    defaults to whichever kind is actually present.
     """
-    return diffrast_rs.policy_prefers_gpu(batch, triangles, pixels)
+    return diffrast_rs.policy_prefers_gpu(batch, triangles, pixels, discrete)
 
 
 def fused_loss(

@@ -88,28 +88,41 @@ fn resolve_device(device: Device, batch: usize, tris: usize, pixels: usize) -> P
 
 /// Should this workload go to the GPU?
 fn prefer_gpu(batch: usize, tris: usize, pixels: usize) -> bool {
-    gpu().is_some() && gpu_is_worth_it(batch, tris, pixels)
+    match gpu() {
+        Some(g) => gpu_is_worth_it(g.is_discrete(), batch, tris, pixels),
+        None => false,
+    }
 }
 
 /// The dispatch policy on its own, so it can be tested against the measured
 /// crossover without needing an adapter present.
 ///
-/// The rule is read off `gpu_bench`'s crossover table rather than off a
-/// preference for the GPU, and **triangle count is the axis that separates the
-/// two regimes**. At 32 triangles the CPU wins or ties at every resolution
-/// measured; at 128 the GPU wins by 2.0-3.6x at every resolution. 64 sits
-/// between them and is the value measured directly by the batch sweep, where
-/// the GPU wins at batch 8 and 64 and ties at 32 — never loses.
+/// **The rule splits on the kind of GPU, because the measurements do.** On an
+/// RTX 4090 against 26 CPU cores the batched backward pass wins every one of
+/// the nine cells `gpu_bench` measures, by 1.7-6.0x, down to 32 triangles at
+/// 64x64. On an integrated AMD part against the same benchmark it *loses* all
+/// nine, by 2-3x. That is not a constant factor to absorb into one threshold:
+/// an integrated GPU competes for the very memory bandwidth that its rival is
+/// using, so more work does not rescue it the way it does on a discrete card.
 ///
-/// The total-work floor is a floor, not a discriminator. An earlier version
-/// used `batch * tris * pixels >= 4e6` as though it predicted the winner; the
-/// current table shows it does not — 8.4M is a 2.04x GPU win in one cell and a
-/// tie in another, and 33.5M is a CPU win. That threshold was calibrated when
-/// resolution genuinely hurt the GPU, which the workgroup reduction fixed.
-/// What remains true is that a few hundred microseconds of fixed overhead
-/// cannot be amortized by a trivially small workload, so a low floor stays.
-fn gpu_is_worth_it(batch: usize, tris: usize, pixels: usize) -> bool {
-    tris >= 64 && batch >= 4 && batch * tris * pixels >= 1_000_000
+/// This is deliberately narrow evidence — one card of each kind — so it is a
+/// default, not a law. `device="gpu"` overrides it in either direction.
+///
+/// History worth keeping, since these thresholds have been wrong twice. They
+/// were once `tris >= 64`, on the reasoning that too few gradient accumulators
+/// meant ruinous atomic contention. That was true and is now fixed: with the
+/// workgroup reduction, buffer pooling and a device-side loss, 32 triangles at
+/// 256x256 went from 0.79x (CPU won) to 3.64x (GPU wins). A threshold that
+/// encodes a bottleneck outlives the bottleneck unless something re-measures.
+fn gpu_is_worth_it(discrete: bool, batch: usize, tris: usize, pixels: usize) -> bool {
+    if !discrete {
+        // Measured to lose at every size tried, so the floor is set above
+        // anything the benchmark covers rather than at a fitted crossover.
+        return batch >= 4 && batch * tris * pixels >= 1_000_000_000;
+    }
+    // Only a floor: below a few hundred thousand pixel-triangles the fixed
+    // ~0.3 ms of submission and readback outweighs anything it saves.
+    batch >= 2 && batch * tris * pixels >= 250_000
 }
 
 /// Rebuild a scene from one row of the parameter tensor.
@@ -402,9 +415,14 @@ fn params_per_triangle() -> usize {
 /// `True` here does not guarantee the GPU was used. Exposed mostly so the
 /// policy can be tested against the measured crossover on machines without a
 /// GPU; `last_device()` is what reports the decision actually taken.
+///
+/// `discrete` selects which measured regime to ask about, and defaults to the
+/// one the present adapter falls in (or discrete, when there is none).
 #[pyfunction]
-fn policy_prefers_gpu(batch: usize, tris: usize, pixels: usize) -> bool {
-    gpu_is_worth_it(batch, tris, pixels)
+#[pyo3(signature = (batch, tris, pixels, discrete = None))]
+fn policy_prefers_gpu(batch: usize, tris: usize, pixels: usize, discrete: Option<bool>) -> bool {
+    let discrete = discrete.unwrap_or_else(|| gpu().is_none_or(|g| g.is_discrete()));
+    gpu_is_worth_it(discrete, batch, tris, pixels)
 }
 
 #[pymodule]
