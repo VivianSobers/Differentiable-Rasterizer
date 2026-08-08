@@ -6,7 +6,10 @@ is the record of checking that, which is worth reading before trusting any
 PSNR number produced by `train.py`.
 
 The short version: the first honest measurement showed the model **losing to a
-flat colour fill**, and the cause was one line of architecture.
+flat colour fill**. Diagnosing why took two attempts — the first blamed an
+architectural choice that turned out to be mostly a confounded default — and
+the current answer is that the model has ample capacity and does not
+generalize.
 
 ## Why the training loss was not evidence
 
@@ -73,22 +76,67 @@ not require pooling all the way to 1x1.
 on the pooling layer, so this is a property of the operation rather than a
 story about one training run.
 
-## The fix, and what it bought
+## The fix
 
 `AdaptiveAvgPool2d(4)` keeps a 4x4 grid of features. Resolution-agnostic still,
-coarse layout preserved. Same seed, same budget, same everything else:
+coarse layout preserved.
 
-| | `pool=1` | `pool=4` |
+## A confounded comparison, and the correction
+
+The first A/B looked spectacular — input gain 0.83 dB for `pool=1` against
+3.41 dB for `pool=4`, a 4.1x improvement. It was wrong, and the way it was
+wrong is worth more than the result would have been.
+
+`train.py` defaulted to `--render-fraction 0.25`: render a quarter of each
+batch, on the reasoning that rendering dominates a step and a noisier gradient
+is a fine trade. That reasoning holds *only when a second loss term covers the
+rest of the batch*. With `--synthetic` there is no parameter supervision, so
+the render loss is the only loss and 75% of every batch contributed nothing —
+loaded, moved to the device, discarded.
+
+Both arms were handicapped identically, so the comparison was fair. It was
+also run at a quarter of the intended data, and that turned out to be where
+most of the difference lived. Re-run with the full batch:
+
+| held-out, 1024 scenes, 8 epochs | `pool=1` | `pool=4` |
 | --- | --- | --- |
-| one-shot PSNR | 18.93 dB | **20.51 dB** |
-| shuffled control | 18.10 dB | 17.10 dB |
-| **input gain** | **0.83 dB** | **3.41 dB** |
-| training loss | 0.01214 | **0.00810** |
+| one-shot PSNR | 20.55 dB | 20.64 dB |
+| **input gain** | 3.51 dB | 3.62 dB |
+| mirror response | 0.12 | 0.20 |
+| training loss | 0.00805 | **0.00764** |
 
-**4.1x more of the score comes from reading the image.** Note that the shuffled
-score went *down* while the one-shot score went up — exactly the signature of a
-model becoming specific to its input rather than better at averaging. A model
-that had merely gotten better in general would have lifted both.
+`pool=1`'s input gain went from 0.83 dB to 3.51 dB purely by not throwing the
+batch away. The architecture was not what was crippling it; data starvation
+was, and the pooling choice merely made starvation hurt more.
+
+The default is now `1.0` unless `--pretrain` supplies the second loss term,
+and an explicit fractional render without one prints a warning. A default that
+silently discards most of a batch is a bad default, and it cost a real
+experiment here before anyone noticed.
+
+## Where the architecture does matter
+
+Capacity, which the generalization numbers above cannot see. Train each arm to
+memorize 16 images — a task they should be able to solve outright, since the
+targets *are* 32-triangle renders — and compare against what a direct fit
+achieves on the same images:
+
+| 16 images, 800 steps, full batch | PSNR | vs ceiling |
+| --- | --- | --- |
+| direct fit, 200 Adam steps | **27.47 dB** | — |
+| `pool=4` | 27.07 dB | -0.40 dB |
+| `pool=1` | 25.21 dB | -2.26 dB |
+| per-image mean colour | 20.59 dB | — |
+
+`pool=4` essentially saturates the ceiling: it memorizes as well as the fitter
+optimizes. `pool=1` cannot, by 2.3 dB, and that gap survives the full batch.
+So the pooling choice is real — it just governs how well the model *can* fit,
+not how well it currently generalizes.
+
+The ceiling itself is the other useful number here. 27.5 dB, not 40: recovering
+a triangle scene from its render is a hard non-convex problem even with the
+right triangle count and unlimited iterations. Every model number on this page
+should be read against 27.5, not against perfection.
 
 ## Does it actually save fitting iterations?
 
@@ -113,31 +161,46 @@ quality reached.
 
 ## What is still wrong
 
-Two of the three verdicts still fire at this budget, and neither is resolved:
+Both arms still fail two of the three verdicts on held-out data:
 
-- **It still loses to the mean-colour baseline**, though the gap fell from
-  1.88 dB to 0.30 dB.
-- **Mirror response is unchanged at 0.14.** The model responds to colour
-  statistics far more than to layout — mirroring preserves colour exactly, and
-  the prediction barely moves.
+- **They lose to the mean-colour baseline** — 20.64 dB against 20.81 dB. Close,
+  but a model that cost 700k parameters should beat a flat fill outright.
+- **Mirror response is 0.20.** The prediction responds to colour statistics far
+  more than to layout. Mirroring an image leaves its colours untouched and
+  demands that every triangle move; the model barely reacts.
 
-This run is small enough that "undertrained" is a live explanation for both:
-48px, width 16, 8 epochs, 1024 images, a 3x3 feature map before pooling. The
-honest statement is that `pool=4` is a clear improvement on an identical
-budget, and that whether the remaining gap is budget or architecture is
-**not yet measured**. The next lever to try, if a longer run does not close it,
-is a head that reads spatial features per-triangle rather than a single flat
-vector for all of them.
+The capacity result above says this is **not** a representational limit:
+`pool=4` reaches 27.07 dB when it only has to memorize, within 0.4 dB of what
+direct optimization achieves. It can produce scenes this good. It just cannot
+yet produce the *right* one for an image it has not seen.
+
+That is a generalization gap, and 1024 scenes over 8 epochs at 48px is a
+plausible cause on its own. The experiment that settles it is more data at
+higher resolution, which is what the run in [RUNBOOK.md](RUNBOOK.md) does.
+
+If a 40k-scene run does not close it, the next lever is the head: it currently
+reads one flat pooled vector and emits all triangles from it, so every triangle
+sees the same global summary. A head that lets each triangle attend to its own
+region — which is what the mirror-response number is really complaining about —
+is the structural change that would follow.
 
 ## Reproducing
 
 ```sh
+# generalization arm
 python python/train.py --synthetic --epochs 8 --synthetic-size 1024 \
     --batch 16 --triangles 32 --size 48 --width 16 --pool 4 --out runs/pool4
+
+# capacity arm: same model, 16 images, long enough to memorize them
+python python/train.py --synthetic --epochs 400 --synthetic-size 16 \
+    --batch 8 --triangles 32 --size 48 --width 16 --pool 4 --out runs/overfit4
 
 python python/evaluate.py --checkpoint runs/pool4/best.pt --synthetic \
     --count 64 --refine-steps 40
 ```
 
-Set `--pool 1` for the other arm. The evaluation is cheap; run it on anything
-before believing its loss curve.
+Set `--pool 1` for the other arm of either. Both need `--render-fraction 1.0`
+on any build before the default changed, or the comparison measures data
+starvation instead of architecture.
+
+The evaluation is cheap; run it on anything before believing its loss curve.

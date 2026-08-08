@@ -120,6 +120,11 @@ def train_step(
         # Render only a slice: rendering dominates the step even on the GPU
         # path, and a noisier photometric gradient is a good trade for
         # substantially cheaper steps.
+        #
+        # This trade only holds when there is a second loss term covering the
+        # rest of the batch. Without parameter supervision the unrendered
+        # images contribute nothing at all — they are loaded, moved to the
+        # device and discarded. `main` warns about that configuration.
         n = max(1, int(len(images) * args.render_fraction))
         rendered = rasterize(
             predicted[:n],
@@ -153,6 +158,20 @@ def main() -> int:
 
     dataset = build_dataset(args)
     triangles = getattr(dataset, "triangles", args.triangles)
+
+    # Without --pretrain there is no parameter-supervision term, so the render
+    # loss is the *only* loss and a fractional render silently throws most of
+    # each batch away. Cheap to get wrong, invisible in the loss curve, and it
+    # costs exactly the data the model is short of.
+    if is_main and args.render_fraction < 1.0 and not args.pretrain:
+        used = max(1, int(args.batch * args.render_fraction))
+        print(
+            f"warning: --render-fraction {args.render_fraction} with no parameter "
+            f"supervision means {args.batch - used} of every {args.batch} images "
+            f"contribute nothing.\n"
+            f"         Pass --render-fraction 1.0 unless you are deliberately "
+            f"trading data for speed."
+        )
 
     sampler = DistributedSampler(dataset) if world_size > 1 else None
     loader = DataLoader(
@@ -295,8 +314,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--render-fraction",
         type=float,
-        default=0.25,
-        help="share of each batch that gets the (CPU-bound) render loss",
+        default=None,
+        help="share of each batch that gets the render loss "
+        "(default: 0.25 with --pretrain, 1.0 otherwise)",
     )
     p.add_argument("--param-weight", type=float, default=1.0)
     p.add_argument(
@@ -307,6 +327,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = p.parse_args()
+
+    # The default depends on whether a second loss term exists. With
+    # --pretrain, parameter supervision covers the unrendered part of the batch
+    # and rendering a slice is a good trade. Without it the render loss is the
+    # only loss, so a fractional render just discards data — which is a
+    # mistake this defaulted everyone into, and which cost a real experiment
+    # here before it was noticed.
+    if args.render_fraction is None:
+        args.render_fraction = 0.25 if args.pretrain else 1.0
     if not 0 < args.render_fraction <= 1:
         p.error("--render-fraction must be in (0, 1]")
     args.param_weight_initial = args.param_weight
