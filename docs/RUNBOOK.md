@@ -134,6 +134,41 @@ If you want the two boxes doing genuinely different things:
 Then A also serves as the evaluation runner: point it at `runs/*/best.pt` and
 render comparisons while B keeps training.
 
+## 3b. The twelve-hour sweep
+
+One run answers "does it work". It cannot answer "what makes it better",
+because a single point has no slope. `sweep.py` runs several configurations
+that differ in one variable at a time, evaluates each with the controls from
+`evaluate.py`, and prints a table.
+
+```sh
+nohup python python/sweep.py --plan scaling --hours 12 \
+    --concurrency 3 --workers 6 --out runs/sweep > runs/sweep.log 2>&1 &
+
+tail -f runs/sweep.log          # progress
+nvidia-smi                      # should show three python processes
+```
+
+**Concurrency is deliberate.** A 3.7M-parameter model that round-trips the
+rasterizer through the host leaves a 4090 substantially idle; three runs share
+it far better than one does. `--concurrency` and `--workers` multiply, so
+3 x 6 = 18 dataloader workers plus 3 main processes fits 26 cores with room.
+
+Safety properties, because twelve hours is long enough for something to go
+wrong:
+
+- Each run is **skipped if already complete** and **resumed from `last.pt` if
+  interrupted**, so re-running the same command continues the sweep.
+- `--hours` bounds when new runs are *launched*, not when they finish.
+- A run that completes every epoch but exits non-zero is kept, with a note.
+  That is the shutdown segfault, and it happens after the checkpoints are
+  safely written.
+- `last.pt` is written to a temporary path and renamed, so a crash mid-save
+  cannot leave an unloadable file where the resume path looks for one.
+
+Other plans: `data` (10k/40k/160k scenes), `model` (width 32/64/96),
+`triangles` (32/64/128/256), `baseline` (just reproduces the measured run).
+
 ## 4. What to send back
 
 Three things, in order of usefulness:
