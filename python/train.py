@@ -208,8 +208,46 @@ def main() -> int:
 
     history: list[dict] = []
     best = math.inf
+    first_epoch = 0
 
-    for epoch in range(args.epochs):
+    # A twelve-hour run that dies at hour nine and restarts from zero has
+    # wasted nine hours. Resuming restores the optimizer and scheduler as well
+    # as the weights: Adam's moments and a OneCycle schedule's position are
+    # part of the training state, and reloading only the weights silently
+    # restarts the learning-rate cycle from its warmup.
+    if args.resume:
+        blob = torch.load(args.resume, map_location=device, weights_only=False)
+        target = model.module if world_size > 1 else model
+        target.load_state_dict(blob["model"])
+        if "optimizer" in blob:
+            # OneCycle is defined over a *fixed* horizon — it anneals to a
+            # floor at exactly `total_steps`. Resuming into a run with a
+            # different `--epochs` is therefore not the same schedule, and
+            # silently continuing steps past the old total raises deep inside
+            # the scheduler with nothing pointing back to here.
+            saved_total = blob["schedule"].get("total_steps")
+            if saved_total is not None and saved_total != steps:
+                raise SystemExit(
+                    f"cannot resume: this checkpoint was trained on a schedule of "
+                    f"{saved_total} steps, and --epochs {args.epochs} gives {steps}.\n"
+                    f"Resume with the same --epochs and --batch as the original run "
+                    f"(it was --epochs {blob.get('args', {}).get('epochs', '?')}), or "
+                    f"start a fresh run to train for longer."
+                )
+            opt.load_state_dict(blob["optimizer"])
+            schedule.load_state_dict(blob["schedule"])
+            first_epoch = blob.get("epoch", -1) + 1
+            best = blob.get("best", math.inf)
+            history = blob.get("history", [])
+        elif is_main:
+            print("warning: checkpoint has no optimizer state, restarting the schedule")
+        if is_main:
+            print(f"resumed from {args.resume} at epoch {first_epoch}, best {best:.6f}")
+
+    if first_epoch >= args.epochs and is_main:
+        print(f"nothing to do: checkpoint is already at epoch {first_epoch} of {args.epochs}")
+
+    for epoch in range(first_epoch, args.epochs):
         model.train()
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -258,6 +296,10 @@ def main() -> int:
             print(f"epoch {epoch:>3}  sigma {sigma:.4f}  {summary}  ({elapsed:.1f}s)")
 
             score = means.get("render_loss", means.get("loss", math.inf))
+            improved = score < best
+            if improved:
+                best = score
+
             state = model.module.state_dict() if world_size > 1 else model.state_dict()
             checkpoint = {
                 "model": state,
@@ -266,10 +308,21 @@ def main() -> int:
                 "pool": args.pool,
                 "epoch": epoch,
                 "args": vars(args),
+                # Enough to resume rather than merely to evaluate. `best` is
+                # recorded after this epoch's comparison, so a resumed run does
+                # not overwrite a better checkpoint with a worse one.
+                "optimizer": opt.state_dict(),
+                "schedule": schedule.state_dict(),
+                "best": best,
+                "history": history,
             }
-            torch.save(checkpoint, out_dir / "last.pt")
-            if score < best:
-                best = score
+            # `last.pt` is written to a temporary name first: a crash partway
+            # through a 45 MB save would otherwise leave an unloadable file
+            # exactly where the resume path looks for one.
+            tmp = out_dir / "last.pt.tmp"
+            torch.save(checkpoint, tmp)
+            tmp.replace(out_dir / "last.pt")
+            if improved:
                 torch.save(checkpoint, out_dir / "best.pt")
             (out_dir / "history.json").write_text(json.dumps(history, indent=2))
 
@@ -307,6 +360,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None, help="cap dataset size")
     p.add_argument("--synthetic-size", type=int, default=20_000)
     p.add_argument("--out", default="runs/amortized")
+    p.add_argument("--resume", help="continue from a checkpoint written by a previous run")
 
     p.add_argument("--sigma-start", type=float, default=0.02)
     p.add_argument("--sigma-end", type=float, default=0.003)
