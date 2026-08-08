@@ -28,16 +28,40 @@ use diffrast::scene::{Scene, Triangle};
 
 const N_PARAMS: usize = 10;
 
-/// One GPU device, created on first use and shared thereafter.
+/// One GPU device, created on first use and shared thereafter, and released
+/// deliberately rather than at process teardown.
 ///
-/// Initializing a device and compiling six shaders takes long enough that doing
-/// it per call would swamp the work. `OnceLock` also means a machine with no
-/// usable adapter pays the failed probe exactly once and then falls back to the
-/// CPU silently.
-static GPU: std::sync::OnceLock<Option<diffrast_gpu::GpuRasterizer>> = std::sync::OnceLock::new();
+/// Initializing a device and compiling seven shaders takes long enough that
+/// doing it per call would swamp the work, and a machine with no usable
+/// adapter pays the failed probe exactly once before falling back to the CPU.
+///
+/// This used to be a plain `OnceLock<Option<_>>`, and a `static` is never
+/// dropped: the device, its queue and the driver threads behind them stayed
+/// alive until the process unloaded this shared library. That is a bad moment
+/// for a Vulkan driver to tear down — especially in a process that is also
+/// shutting down CUDA — and it showed up as a segfault at interpreter exit,
+/// after training had finished and every checkpoint was safely written.
+///
+/// Wrapping it in a lock makes the device droppable at a controlled point.
+/// `shutdown_gpu()` empties it; `torch_layer` registers that with `atexit`.
+static GPU: std::sync::OnceLock<std::sync::RwLock<Option<diffrast_gpu::GpuRasterizer>>> =
+    std::sync::OnceLock::new();
 
-fn gpu() -> Option<&'static diffrast_gpu::GpuRasterizer> {
-    GPU.get_or_init(|| diffrast_gpu::GpuRasterizer::new().ok()).as_ref()
+fn gpu_slot() -> &'static std::sync::RwLock<Option<diffrast_gpu::GpuRasterizer>> {
+    GPU.get_or_init(|| std::sync::RwLock::new(diffrast_gpu::GpuRasterizer::new().ok()))
+}
+
+/// Run `f` against the GPU, or return `None` when there isn't one.
+///
+/// A read lock is held for the duration, so a shutdown cannot pull the device
+/// out from under work that is already running.
+fn with_gpu<R>(f: impl FnOnce(&diffrast_gpu::GpuRasterizer) -> R) -> Option<R> {
+    let slot = gpu_slot().read().ok()?;
+    slot.as_ref().map(f)
+}
+
+fn gpu_available() -> bool {
+    with_gpu(|_| ()).is_some()
 }
 
 /// Which device the last call actually used. Exposed so tests can assert the
@@ -75,7 +99,7 @@ fn resolve_device(device: Device, batch: usize, tris: usize, pixels: usize) -> P
     Ok(match device {
         Device::Cpu => false,
         Device::Gpu => {
-            if gpu().is_none() {
+            if !gpu_available() {
                 return Err(PyValueError::new_err(
                     "device=\"gpu\" requested but no adapter is available",
                 ));
@@ -88,10 +112,7 @@ fn resolve_device(device: Device, batch: usize, tris: usize, pixels: usize) -> P
 
 /// Should this workload go to the GPU?
 fn prefer_gpu(batch: usize, tris: usize, pixels: usize) -> bool {
-    match gpu() {
-        Some(g) => gpu_is_worth_it(g.is_discrete(), batch, tris, pixels),
-        None => false,
-    }
+    with_gpu(|g| gpu_is_worth_it(g.is_discrete(), batch, tris, pixels)).unwrap_or(false)
 }
 
 /// The dispatch policy on its own, so it can be tested against the measured
@@ -186,7 +207,7 @@ fn render_batch<'py>(
         if use_gpu {
             let scenes: Vec<Scene> =
                 flat.chunks(stride).map(|row| scene_from_params(row, bg)).collect();
-            match gpu().unwrap().render_many(&scenes, rp) {
+            match with_gpu(|g| g.render_many(&scenes, rp)).expect("gpu checked above") {
                 Ok(out) => {
                     note_device(true);
                     return out.into_iter().flat_map(|c| c.data).collect();
@@ -265,7 +286,9 @@ fn backward_batch<'py>(
         if use_gpu {
             let scenes: Vec<Scene> =
                 flat_params.chunks(param_stride).map(|row| scene_from_params(row, bg)).collect();
-            match gpu().unwrap().backward_many_from_grad(&scenes, rp, &flat_grads) {
+            match with_gpu(|g| g.backward_many_from_grad(&scenes, rp, &flat_grads))
+                .expect("gpu checked above")
+            {
                 Ok(out) => {
                     note_device(true);
                     return out.into_iter().flatten().collect();
@@ -357,7 +380,8 @@ fn fused_loss_backward<'py>(
 
             // Falls back rather than failing: a transient GPU error during a
             // long training run should cost one slow step, not the run.
-            match gpu().unwrap().backward_many(&scenes, rp, &canvases) {
+            match with_gpu(|g| g.backward_many(&scenes, rp, &canvases)).expect("gpu checked above")
+            {
                 Ok(out) => {
                     note_device(true);
                     return out;
@@ -397,10 +421,32 @@ fn last_device() -> &'static str {
     }
 }
 
+/// Release the GPU device now, rather than at process teardown.
+///
+/// Returns `True` if a device was actually released. Safe to call more than
+/// once, and safe to call when there is no GPU. After this, a later call that
+/// wants the GPU falls back to the CPU rather than reinitializing — shutdown
+/// is meant to be the last thing that happens.
+///
+/// `torch_layer` registers this with `atexit`, which is the whole point: it
+/// moves the teardown to a moment when the interpreter is still healthy,
+/// instead of leaving a live Vulkan device to be unloaded underneath a process
+/// that is already dismantling CUDA.
+#[pyfunction]
+fn shutdown_gpu() -> bool {
+    match GPU.get() {
+        Some(lock) => match lock.write() {
+            Ok(mut slot) => slot.take().is_some(),
+            Err(_) => false,
+        },
+        None => false,
+    }
+}
+
 /// Name of the GPU adapter in use, or `None` if there is no usable device.
 #[pyfunction]
 fn gpu_adapter() -> Option<String> {
-    gpu().map(|g| g.adapter_info().to_string())
+    with_gpu(|g| g.adapter_info().to_string())
 }
 
 /// Number of parameters per triangle, so Python never hardcodes it.
@@ -421,7 +467,7 @@ fn params_per_triangle() -> usize {
 #[pyfunction]
 #[pyo3(signature = (batch, tris, pixels, discrete = None))]
 fn policy_prefers_gpu(batch: usize, tris: usize, pixels: usize, discrete: Option<bool>) -> bool {
-    let discrete = discrete.unwrap_or_else(|| gpu().is_none_or(|g| g.is_discrete()));
+    let discrete = discrete.unwrap_or_else(|| with_gpu(|g| g.is_discrete()).unwrap_or(true));
     gpu_is_worth_it(discrete, batch, tris, pixels)
 }
 
@@ -434,6 +480,7 @@ fn diffrast_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gpu_adapter, m)?)?;
     m.add_function(wrap_pyfunction!(last_device, m)?)?;
     m.add_function(wrap_pyfunction!(policy_prefers_gpu, m)?)?;
+    m.add_function(wrap_pyfunction!(shutdown_gpu, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

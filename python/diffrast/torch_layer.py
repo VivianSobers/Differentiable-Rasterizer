@@ -17,6 +17,8 @@ boundary and nowhere else, so the rest of the Python code is idiomatic torch.
 
 from __future__ import annotations
 
+import atexit
+
 import torch
 from torch import Tensor
 
@@ -120,6 +122,22 @@ def last_device() -> str:
     timing-based check once already.
     """
     return diffrast_rs.last_device()
+
+
+def shutdown_gpu() -> bool:
+    """Release the rasterizer's GPU device.
+
+    Registered with `atexit` below, so callers never need this. Exposed for
+    the case where a process wants the device gone before it exits.
+    """
+    return diffrast_rs.shutdown_gpu()
+
+
+# A live Vulkan device torn down during library unload — in a process that is
+# simultaneously shutting CUDA down — segfaulted at interpreter exit, after
+# training had completed and every checkpoint was written. Releasing it at a
+# point where the interpreter is still healthy avoids that ordering entirely.
+atexit.register(shutdown_gpu)
 
 
 def policy_prefers_gpu(
