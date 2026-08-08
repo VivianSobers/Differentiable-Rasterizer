@@ -520,7 +520,7 @@ having compiled the same WGSL through entirely different toolchains.
 
 ```sh
 cargo test --release          # 86 Rust tests
-python -m unittest discover -s python -p "test_*.py"   # 50 Python tests
+python -m unittest discover -s python -p "test_*.py"   # 51 Python tests
 cargo clippy --all-targets    # clean
 cargo fmt --all -- --check
 ```
