@@ -142,7 +142,31 @@ Three things, in order of usefulness:
    and worth re-reading `crossover` if `prefer_gpu`'s thresholds are touched:
    `test_policy_matches_the_discrete_crossover` pins that table and has to move
    with it.
-2. `runs/*/history.json` — shows whether the amortized model is actually
-   learning or just memorizing the warm start.
+2. **The output of `evaluate.py`** — now the most useful thing on this list,
+   and the reason to run training at all. `history.json` shows the loss going
+   down, which turns out not to be evidence of anything: a model that ignores
+   its input entirely also drives that loss down. See
+   [AMORTIZED.md](AMORTIZED.md).
+
+   A real run, and its evaluation:
+
+   ```sh
+   python python/train.py --synthetic --epochs 60 --synthetic-size 40000 \
+       --batch 64 --triangles 64 --size 96 --width 32 --pool 4 \
+       --raster-device auto --out runs/pool4
+
+   python python/evaluate.py --checkpoint runs/pool4/best.pt --synthetic \
+       --count 256 --refine-steps 100 --out runs/pool4/eval.json
+   ```
+
+   The numbers to read are `input gain` and whether one-shot PSNR clears the
+   mean-colour baseline. On the small local run they were 3.41 dB and *no* —
+   the model still lost to a flat colour fill by 0.30 dB. Whether that is the
+   budget or the architecture is the open question, and 40k scenes at 96px
+   answers it.
+
+   Worth running the `--pool 1` arm too if there is spare time: the local
+   comparison used a model small enough that the conclusion deserves
+   confirmation at scale.
 3. Peak GPU memory during training (`nvidia-smi` during a run) — tells us how
    much headroom there is for larger batches or more triangles.
