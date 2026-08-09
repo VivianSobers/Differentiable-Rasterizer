@@ -110,6 +110,18 @@ Many different triangle sets render to the same image, so matching a particular
 fit is a weaker signal than matching its output — useful as a warm start,
 misleading as an objective.
 
+**One render per step, not two.** The obvious training loss —
+`F.mse_loss(rasterize(params, ...), target)` — renders the batch twice: once
+for the forward, and again inside the backward, which rebuilds the tape it did
+not keep. `fused_mse` computes the loss and the parameter gradients in a single
+Rust call. Identical value, gradients agreeing to 2e-6, and **1.6x faster** per
+step, which matters because rendering is most of a step.
+
+The same waste sat in the GPU path: the gradient-input shader reads the
+rendered batch only when deriving `dL/d(pixel)` from a target, and the training
+entry point is handed that gradient directly — so it was dispatching a full
+forward pass whose output nothing ever read.
+
 **A falling loss here is not evidence the model works**, which took a while to
 appreciate. A network that ignored its input and emitted one generic scene
 still drives the render loss down, because a mid-grey blob scores respectably
@@ -561,7 +573,7 @@ having compiled the same WGSL through entirely different toolchains.
 
 ```sh
 cargo test --release          # 86 Rust tests
-python -m unittest discover -s python -p "test_*.py"   # 61 Python tests
+python -m unittest discover -s python -p "test_*.py"   # 65 Python tests
 cargo clippy --all-targets    # clean
 cargo fmt --all -- --check
 ```
