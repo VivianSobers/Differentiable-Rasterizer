@@ -40,7 +40,17 @@ HERE = Path(__file__).resolve().parent
 
 #: Configurations, as overrides on top of `BASE`. Each plan changes one thing
 #: at a time so the resulting table has interpretable columns.
-BASE = dict(size=96, triangles=64, width=32, pool=4, batch=64, epochs=60, synthetic_size=40000)
+BASE = dict(
+    size=96,
+    triangles=64,
+    width=32,
+    pool=4,
+    batch=64,
+    epochs=60,
+    synthetic_size=40000,
+    sigma_start=0.02,
+    sigma_end=0.003,
+)
 
 PLANS: dict[str, list[dict]] = {
     # The measured run, repeated, so the sweep has a point of comparison
@@ -67,6 +77,32 @@ PLANS: dict[str, list[dict]] = {
         dict(name="tris-64", triangles=64),
         dict(name="tris-128", triangles=128),
         dict(name="tris-256", triangles=256),
+    ],
+    # Separates dataset *diversity* from training *duration*, which the `data`
+    # plan confounds: it holds epochs fixed, so 16x the scenes is also 16x the
+    # gradient steps, and "more data helped" cannot be told apart from "more
+    # compute helped".
+    #
+    # Every row here sees exactly 9.6M samples in exactly 150,000 steps, so the
+    # optimizer schedule and the compute are identical and the *only* thing
+    # that varies is how often the model sees a scene it has seen before —
+    # 240 times, 60 times, or 15.
+    "diversity": [
+        dict(name="div-40k", synthetic_size=40_000, epochs=240),
+        dict(name="div-160k", synthetic_size=160_000, epochs=60),
+        dict(name="div-640k", synthetic_size=640_000, epochs=15),
+    ],
+    # Edge softness has never been tuned, and it is the one hyperparameter that
+    # plausibly trades one-shot quality against *refinement* quality. A model
+    # trained to a sharp final sigma minimizes its own error directly; a
+    # blurrier one commits less, which may leave the fitter a better basin to
+    # descend. Those are different objectives and the repo has only ever
+    # measured the first.
+    "sigma": [
+        dict(name="sigma-sharp", sigma_end=0.0015),
+        dict(name="sigma-mid", sigma_end=0.003),
+        dict(name="sigma-soft", sigma_end=0.006),
+        dict(name="sigma-flat", sigma_start=0.006, sigma_end=0.006),
     ],
     # The headline sweep: more of everything, in the order most likely to pay.
     "scaling": [
@@ -97,6 +133,8 @@ def train_command(config: dict, out: Path, workers: int, resume: bool) -> list[s
         "--size", str(config["size"]),
         "--width", str(config["width"]),
         "--pool", str(config["pool"]),
+        "--sigma-start", str(config["sigma_start"]),
+        "--sigma-end", str(config["sigma_end"]),
         "--render-fraction", "1.0",
         "--raster-device", "auto",
         "--workers", str(workers),
@@ -107,6 +145,15 @@ def train_command(config: dict, out: Path, workers: int, resume: bool) -> list[s
     return cmd
 
 
+#: Every run is graded on this one held-out benchmark, whatever it was trained
+#: on. Scoring each model against scenes matching its own triangle count and
+#: resolution gave each its own exam: absolute PSNR then reflected how hard
+#: that model's eval set happened to be, and the mean-colour baseline moved
+#: with it, so the columns could not be compared. A model's *own* config is
+#: still visible in the table; the yardstick is now fixed.
+BENCHMARK = dict(size=96, triangles=64)
+
+
 def eval_command(config: dict, out: Path, count: int, steps: int) -> list[str]:
     return [
         sys.executable,
@@ -114,7 +161,8 @@ def eval_command(config: dict, out: Path, count: int, steps: int) -> list[str]:
         "--checkpoint", str(out / "best.pt"),
         "--synthetic",
         "--count", str(count),
-        "--size", str(config["size"]),
+        "--size", str(BENCHMARK["size"]),
+        "--eval-triangles", str(BENCHMARK["triangles"]),
         "--refine-steps", str(steps),
         "--out", str(out / "eval.json"),
     ]
@@ -236,20 +284,28 @@ def summarize(runs: list[Run], root: Path) -> None:
         print("\nno evaluations to summarize")
         return
 
-    print(f"\n{'run':<14}{'tris':>6}{'px':>5}{'width':>7}{'scenes':>9}"
-          f"{'one-shot':>10}{'gain':>8}{'baseline':>10}{'mirror':>8}{'beats?':>8}")
+    rows.sort(key=lambda r: r[2].get("margin_db", 0.0), reverse=True)
+
+    print(f"\nall runs scored on one held-out set: "
+          f"{BENCHMARK['triangles']} triangles at {BENCHMARK['size']}px\n")
+    print(f"{'run':<14}{'tris':>6}{'px':>5}{'width':>7}{'scenes':>9}"
+          f"{'margin':>9}{'gain':>8}{'one-shot':>10}{'mirror':>8}{'refine+':>9}")
     for name, config, m in rows:
-        beats = m["one_shot_psnr"] > m["mean_colour_psnr"]
+        refined = m.get("refined_from_model_psnr")
+        scratch = m.get("refined_from_random_psnr")
+        advantage = f"{refined - scratch:+.2f}" if refined and scratch else "-"
         print(
             f"{name:<14}{config['triangles']:>6}{config['size']:>5}{config['width']:>7}"
-            f"{config['synthetic_size']:>9}{m['one_shot_psnr']:>10.2f}"
-            f"{m['input_gain_db']:>8.2f}{m['mean_colour_psnr']:>10.2f}"
-            f"{m['mirror_response']:>8.2f}{'yes' if beats else 'NO':>8}"
+            f"{config['synthetic_size']:>9}"
+            f"{m.get('margin_db', float('nan')):>9.2f}{m['input_gain_db']:>8.2f}"
+            f"{m['one_shot_psnr']:>10.2f}{m['mirror_response']:>8.2f}{advantage:>9}"
         )
 
-    print("\ngain     = dB of one-shot PSNR attributable to reading the input")
+    print("\nmargin   = dB over a flat per-image colour fill. THE column to read:")
+    print("           it is measured against the same baseline on the same set.")
+    print("gain     = dB of one-shot PSNR attributable to reading the input")
     print("mirror   = layout sensitivity; 1.0 fully spatially aware, 0 blind")
-    print("beats?   = does the model beat a flat per-image colour fill")
+    print("refine+  = dB the prediction still leads a random start by, after refinement")
 
     out = root / "summary.json"
     out.write_text(json.dumps([{"name": n, "config": c, "metrics": m} for n, c, m in rows], indent=2))
@@ -263,7 +319,16 @@ def main() -> int:
         return 2
 
     started = time.time()
-    runs = run_sweep(args)
+    if args.evaluate_only:
+        # Re-grade checkpoints that already exist. Evaluation is minutes where
+        # training is hours, so a change to the benchmark should never mean
+        # retraining anything.
+        runs = [
+            Run(config_for(args.plan, o), Path(args.out) / o["name"], args.workers)
+            for o in PLANS[args.plan]
+        ]
+    else:
+        runs = run_sweep(args)
     evaluate_all(runs, args)
     summarize(runs, Path(args.out))
     print(f"\ntotal wall time {(time.time() - started) / 3600:.2f} h")
@@ -291,6 +356,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--eval-count", type=int, default=256)
     p.add_argument("--refine-steps", type=int, default=100)
+    p.add_argument(
+        "--evaluate-only",
+        action="store_true",
+        help="skip training and re-grade the checkpoints already in --out",
+    )
     p.add_argument("--poll", type=float, default=10.0, help="seconds between status checks")
     return p.parse_args()
 
