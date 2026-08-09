@@ -80,6 +80,18 @@ def sigma_at(epoch: int, epochs: int, start: float, end: float) -> float:
     return start * (end / start) ** t
 
 
+def save_atomically(payload: dict, path: Path) -> None:
+    """Write a checkpoint so that `path` is either the old file or the new one.
+
+    `torch.save` straight to the destination leaves a truncated file if the
+    process dies mid-write, and the resume path cannot tell that from a valid
+    one until it fails to load — potentially hours later.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    tmp.replace(path)
+
+
 def build_dataset(args):
     if args.pretrain:
         return PrecomputedFitDataset(args.pretrain)
@@ -329,14 +341,15 @@ def main() -> int:
                 "best": best,
                 "history": history,
             }
-            # `last.pt` is written to a temporary name first: a crash partway
-            # through a 45 MB save would otherwise leave an unloadable file
-            # exactly where the resume path looks for one.
-            tmp = out_dir / "last.pt.tmp"
-            torch.save(checkpoint, tmp)
-            tmp.replace(out_dir / "last.pt")
+            # Written to a temporary name and renamed, because a 45 MB save is
+            # a wide enough window to be interrupted in — by a crash, or by
+            # something as ordinary as `pkill -9` cleaning up a previous job.
+            # A partial file left at either of these paths is worse than no
+            # file: `--resume` and `evaluate.py` both look here, and an
+            # unloadable checkpoint fails much later than a missing one.
+            save_atomically(checkpoint, out_dir / "last.pt")
             if improved:
-                torch.save(checkpoint, out_dir / "best.pt")
+                save_atomically(checkpoint, out_dir / "best.pt")
             (out_dir / "history.json").write_text(json.dumps(history, indent=2))
 
     if world_size > 1:
