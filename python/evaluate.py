@@ -69,9 +69,29 @@ def refine(
     sigma: float,
     lr: float = 0.02,
 ) -> tuple[torch.Tensor, list[float]]:
-    """Run the fitter from `params` and report PSNR after every step."""
+    """Run the fitter from `params`, returning PSNR after each step.
+
+    `trace[i]` is the quality after exactly `i` steps, so `trace[0]` is the
+    unrefined starting point and `trace[steps]` is the final result — the list
+    has `steps + 1` entries.
+
+    That indexing is the point. The obvious loop renders, steps, and records
+    the PSNR of what it just rendered, which is the state *before* the step it
+    is being credited to. The whole trace is then shifted by one: "after 100
+    steps" reports 99, and the count of steps a random start needs to catch a
+    prediction is off by one in the direction that flatters the model. One
+    extra render at the end fixes it, which is cheap against `steps` of them.
+    """
     p = params.clone().detach().requires_grad_(True)
     opt = torch.optim.Adam([p], lr=lr)
+
+    def quality(params_now: torch.Tensor) -> float:
+        with torch.no_grad():
+            rendered = rasterize(
+                params_now, targets.shape[-2], targets.shape[-1], sigma=sigma
+            )
+            return psnr(rendered, targets).item()
+
     trace: list[float] = []
 
     for _ in range(steps):
@@ -79,11 +99,14 @@ def refine(
         rendered = rasterize(p, targets.shape[-2], targets.shape[-1], sigma=sigma)
         loss = F.mse_loss(rendered, targets)
         loss.backward()
+        # Recorded before stepping, which is exactly the "after i steps" value
+        # for the iteration that has not happened yet.
+        trace.append(psnr(rendered.detach(), targets).item())
         opt.step()
         with torch.no_grad():
             p.copy_(clamp_params(p))
-            trace.append(psnr(rendered, targets).item())
 
+    trace.append(quality(p))
     return p.detach(), trace
 
 
@@ -134,8 +157,10 @@ def evaluate(model: TriangleNet, images: torch.Tensor, args) -> dict:
 
         # The amortization claim, as a number: how many steps a random start
         # needs to reach what the model produced with none.
+        # `trace[i]` is now the quality after i steps, so the index *is* the
+        # step count and no longer needs a +1 to compensate for the shift.
         target = out["one_shot_psnr"]
-        reached = next((i + 1 for i, v in enumerate(from_random) if v >= target), None)
+        reached = next((i for i, v in enumerate(from_random) if v >= target), None)
         out["steps_for_random_to_match_model"] = reached
 
     return out
@@ -159,7 +184,7 @@ def report(out: dict) -> None:
 
     if "refined_from_model_psnr" in out:
         steps = out["steps_for_random_to_match_model"]
-        print(f"\nafter {len(out['refine_trace_model'])} refinement steps")
+        print(f"\nafter {len(out['refine_trace_model']) - 1} refinement steps")
         print(f"  from prediction     {out['refined_from_model_psnr']:8.2f} dB")
         print(f"  from random         {out['refined_from_random_psnr']:8.2f} dB")
         if steps is None:

@@ -18,7 +18,8 @@ try:
     from torch import nn
 
     from diffrast.model import N_PARAMS, TriangleNet, count_parameters
-    from evaluate import evaluate
+    from diffrast.torch_layer import psnr, random_params, rasterize
+    from evaluate import evaluate, refine
 
     HAVE_TORCH = True
 except ImportError:  # pragma: no cover - environment-dependent
@@ -143,10 +144,34 @@ class TestEvaluationControls(unittest.TestCase):
         # Uniform noise: a per-image flat fill should beat one fixed scene.
         self.assertGreater(out["mean_colour_psnr"], out["one_shot_psnr"])
 
+    def test_refine_trace_is_indexed_by_step_count(self) -> None:
+        """`trace[i]` must be the quality after exactly `i` steps.
+
+        The natural loop renders, steps, then records the PSNR of what it just
+        rendered — which describes the state *before* that step. Every entry is
+        then credited to one step too many: "after 100 steps" reports 99, and
+        the count of steps a random start needs to catch a prediction comes out
+        one low, in the direction that flatters the model.
+        """
+        targets = rasterize(
+            random_params(2, 6, generator=torch.Generator().manual_seed(1)),
+            24, 24, sigma=0.01,
+        ).detach()
+        start = random_params(2, 6, generator=torch.Generator().manual_seed(2))
+
+        final, trace = refine(start, targets, steps=5, sigma=0.02)
+
+        self.assertEqual(len(trace), 6, "expected steps + 1 entries")
+        with torch.no_grad():
+            at_start = psnr(rasterize(start, 24, 24, sigma=0.02), targets).item()
+            at_end = psnr(rasterize(final, 24, 24, sigma=0.02), targets).item()
+        self.assertAlmostEqual(trace[0], at_start, places=3, msg="trace[0] is not the start")
+        self.assertAlmostEqual(trace[-1], at_end, places=3, msg="trace[-1] is not the result")
+
     def test_refinement_study_runs_and_improves(self) -> None:
         args = argparse.Namespace(sigma=0.02, refine_steps=5)
         out = evaluate(ConstantScene(), self.images(), args)
-        self.assertEqual(len(out["refine_trace_model"]), 5)
+        self.assertEqual(len(out["refine_trace_model"]), 6)  # steps + 1
         self.assertGreaterEqual(out["refined_from_model_psnr"], out["one_shot_psnr"])
 
 
