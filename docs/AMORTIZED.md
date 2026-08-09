@@ -220,6 +220,54 @@ as many. Triangle count drives where refinement ends up; data drives how good
 the prediction is on its own. If the goal is replacing fitting iterations,
 `data-160k` is the better model despite losing on refined PSNR.
 
+## Diversity or compute?
+
+The scaling sweep could not tell those apart: it held epochs fixed, so 4x the
+scenes was also 4x the gradient steps. The `diversity` plan separates them.
+Every arm sees **exactly 9.6M samples in exactly 150,000 steps** — identical
+compute, identical optimizer schedule — and varies only how often a scene
+repeats.
+
+| unique scenes | epochs | margin | gain | one-shot | refined | steps saved |
+| --- | --- | --- | --- | --- | --- | --- |
+| 40k | 240 | 3.48 | 7.27 | 22.16 | 30.24 | 29 |
+| 160k | 60 | 4.43 | 8.18 | 23.11 | 30.21 | 39 |
+| 640k | 15 | **4.56** | **8.29** | **23.23** | 30.30 | **41** |
+
+**Diversity is real and it saturates.** Going 40k -> 160k buys **+0.95 dB** of
+margin at fixed compute; going 160k -> 640k buys **+0.13 dB**. The second
+quadrupling is worth a seventh of the first.
+
+Comparing across the two sweeps decomposes the original confounded result. The
+same 40k scenes trained 4x longer (60 -> 240 epochs) gained +0.53 dB; 4x the
+scenes at fixed compute gained +0.95 dB. Both mattered, diversity roughly twice
+as much — and the earlier "+1.57 dB from 4x data" was about 60% diversity and
+40% compute.
+
+The practical conclusion is that **both levers are now spent**. 160k scenes is
+the knee, more compute is worth half of what more data was, and neither is far
+from flat. Whatever comes next has to be architecture or objective, not scale.
+
+## Refinement erases the difference between models
+
+The most surprising number in that table is the one that does not move.
+
+After 100 refinement steps the three models land at **30.24, 30.21 and 30.30
+dB** — a spread of 0.08 dB, from models whose one-shot predictions differ by
+1.07 dB. The better model does not reach a better place. It arrives sooner:
+29, 39 and 41 fitting iterations skipped.
+
+That is worth being precise about, because it constrains what amortization is
+*for* here. A better predictor is not a route to better final quality; the
+fitter reaches the same optimum regardless of where it starts. It is purely a
+way to spend fewer iterations getting there.
+
+The refinement traces also show every model losing ground on its first step —
+23.23 -> 22.21 before recovering by step 3. Adam at `lr=0.02` is tuned for a
+random initialization, and a good initialization is exactly what it damages.
+Two of the ~40 saved iterations are spent undoing that, and nothing has tried
+lowering the rate when starting from a prediction.
+
 ## Two ways of grading that were both wrong
 
 The first version of this table scored each model on a held-out set matching
