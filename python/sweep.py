@@ -276,13 +276,20 @@ def run_sweep(args) -> list[Run]:
     deadline = time.time() + args.hours * 3600
 
     pending = [Run(config_for(args.plan, o), root / o["name"], args.workers) for o in plan]
-    for run in list(pending):
-        if is_complete(run.out, run.config):
-            print(f"skipping {run.name}: already complete")
-            pending.remove(run)
 
+    # Already-trained runs skip *training*, not evaluation. Dropping them here
+    # meant a sweep whose arms had all finished in an earlier invocation
+    # reported "no evaluations to summarize" and wrote no summary at all — the
+    # results were on disk the whole time, and the resume path is precisely
+    # when you most want the table.
     active: list[Run] = []
     done: list[Run] = []
+
+    for run in list(pending):
+        if is_complete(run.out, run.config):
+            print(f"skipping {run.name}: already trained, will still be evaluated")
+            pending.remove(run)
+            done.append(run)
 
     while pending or active:
         while pending and len(active) < args.concurrency:
