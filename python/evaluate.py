@@ -119,12 +119,14 @@ def evaluate(model: TriangleNet, images: torch.Tensor, args) -> dict:
         out["mirror_response"] = (moved_by_mirror / moved_by_other.clamp_min(1e-12)).item()
 
     if args.refine_steps > 0:
-        _, from_model = refine(predicted, images, args.refine_steps, args.sigma)
+        lr = getattr(args, "refine_lr", 0.02)
+        _, from_model = refine(predicted, images, args.refine_steps, args.sigma, lr)
         scratch = random_params(
             len(images), model.triangles, generator=torch.Generator().manual_seed(0)
         )
-        _, from_random = refine(scratch, images, args.refine_steps, args.sigma)
+        _, from_random = refine(scratch, images, args.refine_steps, args.sigma, lr)
 
+        out["refine_lr"] = lr
         out["refined_from_model_psnr"] = from_model[-1]
         out["refined_from_random_psnr"] = from_random[-1]
         out["refine_trace_model"] = from_model
@@ -227,6 +229,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--sigma", type=float, default=0.003)
     p.add_argument("--refine-steps", type=int, default=0, help="0 skips the refinement study")
+    p.add_argument(
+        "--refine-lr",
+        type=float,
+        default=0.02,
+        help="Adam rate for refinement. The default is tuned for a random start "
+        "and measurably damages a good one: every model loses ground on its "
+        "first step before recovering by the third",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", help="write the metrics as JSON")
     return p.parse_args()
