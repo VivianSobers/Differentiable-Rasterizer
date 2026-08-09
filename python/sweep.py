@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -193,6 +195,35 @@ def is_complete(out: Path, config: dict) -> bool:
     return bool(records) and records[-1]["epoch"] >= config["epochs"] - 1
 
 
+#: Every training subprocess currently in flight, so signal handlers can reach
+#: them. A sweep killed from the outside must not leave orphans behind: they
+#: keep training against the same output directory that a later run will resume
+#: from, and two writers in one directory corrupts both.
+ACTIVE: list[subprocess.Popen] = []
+
+
+def terminate_children(*_) -> None:
+    """Kill every in-flight run's process group, then exit."""
+    for process in ACTIVE:
+        if process.poll() is not None:
+            continue
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    deadline = time.time() + 20
+    for process in ACTIVE:
+        try:
+            process.wait(timeout=max(0.0, deadline - time.time()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    sys.exit(130)
+
+
 class Run:
     def __init__(self, config: dict, out: Path, workers: int) -> None:
         self.config = config
@@ -216,7 +247,13 @@ class Run:
             train_command(self.config, self.out, self.workers, resume),
             stdout=self.log,
             stderr=subprocess.STDOUT,
+            # Its own process group, so the whole tree — trainer plus its
+            # dataloader workers — can be signalled as a unit. Killing only
+            # the trainer leaves the workers orphaned and still consuming the
+            # GPU, which is exactly what happened once.
+            start_new_session=True,
         )
+        ACTIVE.append(self.process)
 
     def finish(self) -> None:
         if self.log is not None:
@@ -354,6 +391,9 @@ def main() -> int:
     if args.plan not in PLANS:
         print(f"unknown plan {args.plan!r}; choose from {', '.join(PLANS)}")
         return 2
+
+    signal.signal(signal.SIGINT, terminate_children)
+    signal.signal(signal.SIGTERM, terminate_children)
 
     started = time.time()
     if args.evaluate_only:
