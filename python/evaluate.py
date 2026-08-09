@@ -105,6 +105,10 @@ def evaluate(model: TriangleNet, images: torch.Tensor, args) -> dict:
 
         mean_colour = images.mean(dim=(2, 3), keepdim=True).expand_as(images)
         out["mean_colour_psnr"] = psnr(mean_colour, images).item()
+        # Absolute PSNR depends on how hard the eval set is; the margin over a
+        # baseline measured on the *same* set does not, which makes this the
+        # number to compare between configurations.
+        out["margin_db"] = out["one_shot_psnr"] - out["mean_colour_psnr"]
 
         # A mirrored image is a different scene — every triangle has to move.
         # A model reading spatial layout should respond about as strongly as it
@@ -140,6 +144,7 @@ def report(out: dict) -> None:
     print(f"  vs shuffled targets {out['shuffled_psnr']:8.2f} dB")
     print(f"  input gain          {out['input_gain_db']:8.2f} dB  <- how much reading the image is worth")
     print(f"mean-colour baseline  {out['mean_colour_psnr']:8.2f} dB  <- must be beaten to be useful")
+    print(f"  margin over it      {out['margin_db']:8.2f} dB  <- comparable across eval sets")
     print(f"mirror response       {out['mirror_response']:8.2f}     <- 1.0 = fully spatially aware, 0 = blind")
 
     verdict = []
@@ -177,13 +182,21 @@ def main() -> int:
     else:
         # A different seed from training's default, so this is held out rather
         # than a re-run of what the model was trained on.
+        # The eval set's complexity is a property of the *benchmark*, not of
+        # the model being benchmarked. Defaulting it to `model.triangles` gave
+        # every model its own private exam and made the resulting PSNRs
+        # incomparable across configurations — a 128-triangle model was scored
+        # against harder targets than a 64-triangle one, and the mean-colour
+        # baseline moved with it. Pass --eval-triangles to fix the exam.
+        eval_triangles = args.eval_triangles or model.triangles
         dataset = SyntheticShapeDataset(
-            length=args.count, size=size, triangles=model.triangles, seed=args.seed + 1
+            length=args.count, size=size, triangles=eval_triangles, seed=args.seed + 1
         )
 
     images = torch.stack([dataset[i] for i in range(min(args.count, len(dataset)))])
     print(f"model: {model.triangles} triangles, pool {model.pool_size}")
-    print(f"eval:  {len(images)} images at {size}px")
+    print(f"eval:  {len(images)} images at {size}px"
+          + (f", {args.eval_triangles} triangles" if args.eval_triangles else ""))
 
     out = evaluate(model, images, args)
     report(out)
@@ -205,6 +218,13 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--count", type=int, default=64, help="images to evaluate")
     p.add_argument("--size", type=int, default=None, help="defaults to the training size")
+    p.add_argument(
+        "--eval-triangles",
+        type=int,
+        default=None,
+        help="triangles in the held-out scenes; fix it to compare models with "
+        "different triangle budgets (default: the model's own count)",
+    )
     p.add_argument("--sigma", type=float, default=0.003)
     p.add_argument("--refine-steps", type=int, default=0, help="0 skips the refinement study")
     p.add_argument("--seed", type=int, default=0)
