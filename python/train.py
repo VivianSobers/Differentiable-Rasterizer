@@ -182,7 +182,9 @@ def main() -> int:
         num_workers=args.workers,
         pin_memory=device.type == "cuda",
         drop_last=True,
-        persistent_workers=args.workers > 0,
+        # Persistent workers hold their own copy of the dataset, so a
+        # resolution change in the parent would never reach them.
+        persistent_workers=args.workers > 0 and not args.sizes,
     )
 
     model = TriangleNet(triangles=triangles, width=args.width, pool=args.pool).to(device)
@@ -251,6 +253,17 @@ def main() -> int:
         model.train()
         if sampler is not None:
             sampler.set_epoch(epoch)
+
+        # Resolution jitter. A model trained at one resolution transfers badly
+        # to another — measured, not assumed: a 128px-trained model went from
+        # +4.44 dB of margin on its own resolution to -1.17 dB at 96px. The
+        # adaptive pool makes varying resolution *possible*; only training
+        # across resolutions makes the model actually invariant to it.
+        if args.sizes:
+            chosen = args.sizes[torch.randint(len(args.sizes), (1,)).item()]
+            dataset.size = chosen
+            if is_main:
+                print(f"  epoch {epoch}: training at {chosen}px")
 
         sigma = sigma_at(epoch, args.epochs, args.sigma_start, args.sigma_end)
         # Decay parameter supervision so the image loss takes over.
@@ -343,6 +356,14 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--triangles", type=int, default=128)
     p.add_argument("--size", type=int, default=64, help="training resolution")
+    p.add_argument(
+        "--sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="train on a different resolution each epoch, chosen from this list; "
+        "the model pools adaptively but nothing has ever made it *use* that",
+    )
     p.add_argument("--width", type=int, default=32, help="model channel width")
     p.add_argument(
         "--pool",
@@ -388,6 +409,11 @@ def parse_args() -> argparse.Namespace:
     # only loss, so a fractional render just discards data — which is a
     # mistake this defaulted everyone into, and which cost a real experiment
     # here before it was noticed.
+    if args.sizes:
+        if args.pretrain:
+            p.error("--sizes cannot be used with --pretrain: those images are already rendered")
+        if any(s <= 0 for s in args.sizes):
+            p.error("--sizes must all be positive")
     if args.render_fraction is None:
         args.render_fraction = 0.25 if args.pretrain else 1.0
     if not 0 < args.render_fraction <= 1:

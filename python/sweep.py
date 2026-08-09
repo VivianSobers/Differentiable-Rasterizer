@@ -104,6 +104,15 @@ PLANS: dict[str, list[dict]] = {
         dict(name="sigma-soft", sigma_end=0.006),
         dict(name="sigma-flat", sigma_start=0.006, sigma_end=0.006),
     ],
+    # Does resolution invariance have to be *trained*, or does adaptive pooling
+    # supply it? Measured: it does not supply it. A 128px-trained model lost
+    # 5.6 dB of margin when graded at 96px. These arms train across resolutions
+    # instead of at one, and are graded at every resolution by `transfer.py`.
+    "resolution": [
+        dict(name="res-fixed96", size=96),
+        dict(name="res-jitter", sizes=[64, 96, 128]),
+        dict(name="res-jitter-wide", sizes=[48, 64, 96, 128, 160]),
+    ],
     # The headline sweep: more of everything, in the order most likely to pay.
     "scaling": [
         dict(name="data-160k", synthetic_size=160_000),
@@ -140,6 +149,8 @@ def train_command(config: dict, out: Path, workers: int, resume: bool) -> list[s
         "--workers", str(workers),
         "--out", str(out),
     ]
+    if config.get("sizes"):
+        cmd += ["--sizes", *[str(v) for v in config["sizes"]]]
     if resume:
         cmd += ["--resume", str(out / "last.pt")]
     return cmd
@@ -154,17 +165,19 @@ def train_command(config: dict, out: Path, workers: int, resume: bool) -> list[s
 BENCHMARK = dict(size=96, triangles=64)
 
 
-def eval_command(config: dict, out: Path, count: int, steps: int) -> list[str]:
+def eval_command(
+    config: dict, out: Path, count: int, steps: int, size: int, name: str
+) -> list[str]:
     return [
         sys.executable,
         str(HERE / "evaluate.py"),
         "--checkpoint", str(out / "best.pt"),
         "--synthetic",
         "--count", str(count),
-        "--size", str(BENCHMARK["size"]),
+        "--size", str(size),
         "--eval-triangles", str(BENCHMARK["triangles"]),
         "--refine-steps", str(steps),
-        "--out", str(out / "eval.json"),
+        "--out", str(out / name),
     ]
 
 
@@ -265,10 +278,27 @@ def evaluate_all(runs: list[Run], args) -> None:
         if run.failed or not (run.out / "best.pt").exists():
             continue
         print(f"evaluating {run.name}")
+        # Twice, because neither grading alone is fair. The shared benchmark
+        # makes rows comparable but penalizes any model trained at another
+        # resolution — measured: a 128px-trained model scored +4.44 dB of
+        # margin on its own resolution and -1.17 dB at 96px, from the same
+        # weights. Reporting both separates "worse model" from "worse
+        # transfer", which one column cannot.
         subprocess.run(
-            eval_command(run.config, run.out, args.eval_count, args.refine_steps),
+            eval_command(
+                run.config, run.out, args.eval_count, args.refine_steps,
+                BENCHMARK["size"], "eval.json",
+            ),
             check=False,
         )
+        if run.config["size"] != BENCHMARK["size"]:
+            subprocess.run(
+                eval_command(
+                    run.config, run.out, args.eval_count, args.refine_steps,
+                    run.config["size"], "eval_native.json",
+                ),
+                check=False,
+            )
 
 
 def summarize(runs: list[Run], root: Path) -> None:
@@ -278,6 +308,10 @@ def summarize(runs: list[Run], root: Path) -> None:
         if not path.exists():
             continue
         m = json.loads(path.read_text())
+        native = run.out / "eval_native.json"
+        m["margin_native_db"] = (
+            json.loads(native.read_text())["margin_db"] if native.exists() else m["margin_db"]
+        )
         rows.append((run.name, run.config, m))
 
     if not rows:
@@ -289,7 +323,7 @@ def summarize(runs: list[Run], root: Path) -> None:
     print(f"\nall runs scored on one held-out set: "
           f"{BENCHMARK['triangles']} triangles at {BENCHMARK['size']}px\n")
     print(f"{'run':<14}{'tris':>6}{'px':>5}{'width':>7}{'scenes':>9}"
-          f"{'margin':>9}{'gain':>8}{'one-shot':>10}{'mirror':>8}{'refine+':>9}")
+          f"{'margin':>9}{'native':>8}{'gain':>8}{'one-shot':>10}{'mirror':>8}{'refine+':>9}")
     for name, config, m in rows:
         refined = m.get("refined_from_model_psnr")
         scratch = m.get("refined_from_random_psnr")
@@ -297,12 +331,15 @@ def summarize(runs: list[Run], root: Path) -> None:
         print(
             f"{name:<14}{config['triangles']:>6}{config['size']:>5}{config['width']:>7}"
             f"{config['synthetic_size']:>9}"
-            f"{m.get('margin_db', float('nan')):>9.2f}{m['input_gain_db']:>8.2f}"
+            f"{m.get('margin_db', float('nan')):>9.2f}"
+            f"{m.get('margin_native_db', float('nan')):>8.2f}{m['input_gain_db']:>8.2f}"
             f"{m['one_shot_psnr']:>10.2f}{m['mirror_response']:>8.2f}{advantage:>9}"
         )
 
-    print("\nmargin   = dB over a flat per-image colour fill. THE column to read:")
-    print("           it is measured against the same baseline on the same set.")
+    print("\nmargin   = dB over a flat colour fill on the SHARED benchmark. Comparable")
+    print("           across rows, but out-of-distribution for other resolutions.")
+    print("native   = the same margin at the model's own training resolution.")
+    print("           margin << native means the model is fine and does not transfer.")
     print("gain     = dB of one-shot PSNR attributable to reading the input")
     print("mirror   = layout sensitivity; 1.0 fully spatially aware, 0 blind")
     print("refine+  = dB the prediction still leads a random start by, after refinement")
