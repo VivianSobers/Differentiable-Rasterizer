@@ -47,7 +47,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from diffrast.data import ImageFolderDataset, PrecomputedFitDataset, SyntheticShapeDataset
 from diffrast.model import TriangleNet, count_parameters
-from diffrast.torch_layer import psnr, rasterize
+from diffrast.torch_layer import fused_mse
 
 
 def is_distributed() -> bool:
@@ -138,18 +138,20 @@ def train_step(
         # images contribute nothing at all — they are loaded, moved to the
         # device and discarded. `main` warns about that configuration.
         n = max(1, int(len(images) * args.render_fraction))
-        rendered = rasterize(
-            predicted[:n],
-            images.shape[-2],
-            images.shape[-1],
-            sigma=sigma,
-            device=args.raster_device,
+        # `fused_mse` rather than `F.mse_loss(rasterize(...), ...)`: identical
+        # value and gradient, one render per step instead of two. The obvious
+        # form renders once for the forward and again inside the backward,
+        # which rebuilds the tape it did not keep — and rendering is most of
+        # the step. Pinned by `test_fused_mse_matches_rasterize_then_mse`.
+        render_loss = fused_mse(
+            predicted[:n], images[:n], sigma=sigma, device=args.raster_device
         )
-        render_loss = F.mse_loss(rendered, images[:n])
         loss = loss + args.render_weight * render_loss
         metrics["render_loss"] = render_loss.item()
-        with torch.no_grad():
-            metrics["psnr"] = psnr(rendered, images[:n]).item()
+        # PSNR is a pure function of the MSE at a fixed peak, so it comes out
+        # of the loss rather than costing another render.
+        mse = metrics["render_loss"]
+        metrics["psnr"] = float("inf") if mse <= 0 else 10.0 * math.log10(1.0 / mse)
 
     metrics["loss"] = loss.item()
     return loss, metrics

@@ -20,6 +20,7 @@ try:
         N_PARAMS,
         clamp_params,
         fused_loss,
+        fused_mse,
         gpu_adapter,
         last_device,
         policy_prefers_gpu,
@@ -226,6 +227,55 @@ class TestFusedLoss(unittest.TestCase):
         p = random_params(1, 4, generator=torch.Generator().manual_seed(0))
         with self.assertRaises(ValueError):
             fused_loss(p, torch.rand(1, 3, 8, 8, 1))
+
+
+@unittest.skipUnless(HAVE_TORCH, "torch or diffrast_rs not installed")
+class TestFusedMSE(unittest.TestCase):
+    """The training loss, fused into one render instead of two."""
+
+    def test_fused_mse_matches_rasterize_then_mse(self) -> None:
+        """Same number, same gradient — this is a speedup, not a change.
+
+        `F.mse_loss(rasterize(p), target)` renders twice per step: once for
+        the forward, and again inside the backward to rebuild the tape it did
+        not keep. `fused_mse` does both in one Rust call, so this has to agree
+        to float tolerance or the optimization is not free.
+        """
+        gen = torch.Generator().manual_seed(0)
+        params = random_params(4, 12, generator=gen)
+        target = rasterize(
+            random_params(4, 12, generator=torch.Generator().manual_seed(1)),
+            32, 32, sigma=0.01,
+        ).detach()
+
+        a = params.clone().requires_grad_(True)
+        F.mse_loss(rasterize(a, 32, 32, sigma=0.01), target).backward()
+
+        b = params.clone().requires_grad_(True)
+        fused = fused_mse(b, target, sigma=0.01)
+        fused.backward()
+
+        reference = F.mse_loss(rasterize(params, 32, 32, sigma=0.01), target)
+        self.assertAlmostEqual(fused.item(), reference.item(), places=6)
+        rel = (a.grad - b.grad).abs().max() / a.grad.norm().clamp_min(1e-12)
+        self.assertLess(rel.item(), 1e-4, f"gradient gap {rel.item():.2e}")
+
+    def test_gradients_reach_a_network_through_the_fused_loss(self) -> None:
+        net = torch.nn.Linear(4, 6 * N_PARAMS)
+        target = torch.rand(2, 3, 16, 16, generator=torch.Generator().manual_seed(2))
+
+        fused_mse(net(torch.randn(2, 4)).view(2, 6, N_PARAMS), target, sigma=0.02).backward()
+
+        self.assertIsNotNone(net.weight.grad)
+        self.assertTrue(torch.isfinite(net.weight.grad).all())
+        self.assertGreater(net.weight.grad.abs().sum(), 0)
+
+    def test_rejects_bad_shapes(self) -> None:
+        p = random_params(2, 4, generator=torch.Generator().manual_seed(0))
+        with self.assertRaises(ValueError):
+            fused_mse(p, torch.rand(2, 16, 16, 3))  # channels-last target
+        with self.assertRaises(ValueError):
+            fused_mse(p, torch.rand(2, 3, 16, 16), sigma=0.0)
 
 
 @unittest.skipUnless(HAVE_TORCH, "torch or diffrast_rs not installed")

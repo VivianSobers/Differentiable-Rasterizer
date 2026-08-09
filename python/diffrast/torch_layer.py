@@ -108,6 +108,66 @@ def rasterize(
     return images.permute(0, 3, 1, 2).contiguous() if channels_first else images
 
 
+class _FusedMSE(torch.autograd.Function):
+    """Photometric MSE against a target, in one Rust call.
+
+    `F.mse_loss(rasterize(params, ...), target)` costs **two** renders per
+    training step: `rasterize` renders once for the forward, and the backward
+    renders again to rebuild the tape it did not keep. The loss is a pure
+    function of the parameters and the target, so both can be had from a single
+    call — which is exactly what `fused_loss_backward` already computes.
+    """
+
+    @staticmethod
+    def forward(ctx, params: Tensor, targets: Tensor, sigma: float, background, device):
+        params_np = params.detach().to("cpu", torch.float32).contiguous().numpy()
+        targets_np = targets.detach().to("cpu", torch.float32).contiguous().numpy()
+        losses, grads = diffrast_rs.fused_loss_backward(
+            params_np, targets_np, sigma, background, device
+        )
+        ctx.save_for_backward(torch.from_numpy(grads).to(params.device, params.dtype))
+        ctx.batch = len(params)
+        # `fused_loss_backward` returns per-item losses as a plain list.
+        return torch.tensor(losses, device=params.device, dtype=params.dtype).mean()
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        (grads,) = ctx.saved_tensors
+        # `fused_loss_backward` differentiates the *sum* of per-item MSE; the
+        # forward above returns their mean, so the chain rule needs the 1/B.
+        return grad_out * grads / ctx.batch, None, None, None, None
+
+
+def fused_mse(
+    params: Tensor,
+    targets: Tensor,
+    sigma: float = 0.0015,
+    background: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    device: str = "auto",
+) -> Tensor:
+    """Mean squared error between the rendered scenes and `targets`.
+
+    Equivalent to `F.mse_loss(rasterize(params, H, W, sigma), targets)` and
+    differentiable back to `params` — but with one render per step instead of
+    two, which is most of the cost of a training step.
+
+    Args:
+        params: `(B, T, 10)` scene parameters.
+        targets: `(B, 3, H, W)`, matching what `rasterize` returns.
+    """
+    if params.dim() != 3 or params.shape[-1] != N_PARAMS:
+        raise ValueError(
+            f"expected params of shape (B, T, {N_PARAMS}), got {tuple(params.shape)}"
+        )
+    if targets.dim() != 4 or targets.shape[1] != 3:
+        raise ValueError(f"expected targets of shape (B, 3, H, W), got {tuple(targets.shape)}")
+    if not (sigma > 0):
+        raise ValueError("sigma must be positive")
+
+    hwc = targets.permute(0, 2, 3, 1).contiguous()
+    return _FusedMSE.apply(params, hwc, sigma, background, device)
+
+
 def gpu_adapter() -> str | None:
     """Name of the GPU the extension will use, or `None` if there is none."""
     return diffrast_rs.gpu_adapter()

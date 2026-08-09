@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -46,7 +47,13 @@ import torch.nn.functional as F
 
 from diffrast.data import ImageFolderDataset, SyntheticShapeDataset
 from diffrast.model import TriangleNet
-from diffrast.torch_layer import clamp_params, psnr, random_params, rasterize
+from diffrast.torch_layer import (
+    clamp_params,
+    fused_loss,
+    psnr,
+    random_params,
+    rasterize,
+)
 
 
 def load_model(path: str | Path) -> tuple[TriangleNet, dict]:
@@ -60,6 +67,13 @@ def load_model(path: str | Path) -> tuple[TriangleNet, dict]:
     model.load_state_dict(checkpoint["model"])
     model.eval()
     return model, checkpoint
+
+
+def mse_to_psnr(mse: float, max_value: float = 1.0) -> float:
+    """PSNR in dB from a mean squared error, matching `torch_layer.psnr`."""
+    if mse <= 0:
+        return float("inf")
+    return 10.0 * math.log10(max_value**2 / mse)
 
 
 def refine(
@@ -82,31 +96,39 @@ def refine(
     prediction is off by one in the direction that flatters the model. One
     extra render at the end fixes it, which is cheap against `steps` of them.
     """
-    p = params.clone().detach().requires_grad_(True)
+    p = params.clone().detach()
     opt = torch.optim.Adam([p], lr=lr)
 
-    def quality(params_now: torch.Tensor) -> float:
-        with torch.no_grad():
-            rendered = rasterize(
-                params_now, targets.shape[-2], targets.shape[-1], sigma=sigma
-            )
-            return psnr(rendered, targets).item()
+    # `fused_loss` is built for exactly this: optimizing parameters directly,
+    # with no network above them. It returns per-item MSE and parameter
+    # gradients from one Rust call, skipping the autograd graph and never
+    # materializing the rendered batch in Python. Going through `rasterize`
+    # instead meant building a graph per step to immediately discard it, and
+    # paying an extra render just to report the quality — the losses it hands
+    # back give that for free.
+    hwc = targets.permute(0, 2, 3, 1).contiguous()
+    batch = len(targets)
+
+    def step_quality() -> tuple[float, torch.Tensor]:
+        losses, grads = fused_loss(p, hwc, sigma=sigma)
+        # `fused_loss` differentiates the *sum* of per-item MSE; `F.mse_loss`
+        # averages. Adam largely normalizes a constant factor away, but not
+        # exactly — epsilon and bias correction both see the raw magnitude —
+        # so this stays faithful to what the loop used to compute.
+        return losses.mean().item(), grads / batch
 
     trace: list[float] = []
 
     for _ in range(steps):
+        mse, grads = step_quality()
+        trace.append(mse_to_psnr(mse))
         opt.zero_grad(set_to_none=True)
-        rendered = rasterize(p, targets.shape[-2], targets.shape[-1], sigma=sigma)
-        loss = F.mse_loss(rendered, targets)
-        loss.backward()
-        # Recorded before stepping, which is exactly the "after i steps" value
-        # for the iteration that has not happened yet.
-        trace.append(psnr(rendered.detach(), targets).item())
+        p.grad = grads
         opt.step()
         with torch.no_grad():
             p.copy_(clamp_params(p))
 
-    trace.append(quality(p))
+    trace.append(mse_to_psnr(step_quality()[0]))
     return p.detach(), trace
 
 

@@ -848,8 +848,21 @@ impl GpuRasterizer {
         let packed = self.pack_batch_with(scenes, p, n_tris, true);
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // No forward pass here, deliberately.
+        //
+        // The shader reads `rendered` only to derive `dL/d(pixel)` from a
+        // target, and this entry point is given that gradient directly — the
+        // whole reason it exists. Everything else it needs, including the
+        // canvas beneath each triangle, it recomputes. So the rendered batch
+        // is never read, and rendering it was a full dispatch per call whose
+        // result went nowhere.
+        //
+        // That cost landed squarely on training: this is the path every
+        // `loss.backward()` through the PyTorch layer takes. The buffer is
+        // still allocated because the bind group layout requires binding 2 to
+        // exist; its contents are irrelevant.
         let image_buf = self.image_buffer(p, batch);
-        self.encode_forward(&mut encoder, &packed, p, batch, &image_buf);
 
         let grad_in_buf = self.pooled(
             "grad_in",
