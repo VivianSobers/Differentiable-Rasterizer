@@ -82,8 +82,14 @@ class TriangleNet(nn.Module):
             ConvBlock(width * 4, width * 8),
             ConvBlock(width * 8, width * 8),
         )
-        # Adaptive pooling makes the model resolution-agnostic: it can be
-        # trained at 64px and run at 256px without reshaping the head.
+        # Adaptive pooling lets one model accept any input resolution: it can
+        # be trained at 64px and run at 256px without reshaping the head.
+        #
+        # That is a statement about tensor shapes, and it is worth being clear
+        # that it is *not* a statement about accuracy. Measured: a model
+        # trained at 128px scored +4.44 dB of margin over baseline at 128px
+        # and -1.17 dB at 96px, from the same weights. The shapes fit; the
+        # model does not transfer. Train with `--sizes` if you need it to.
         #
         # The size matters enormously, and pooling to 1x1 — the obvious choice,
         # and what this was — is close to the worst possible one *for this
@@ -93,9 +99,9 @@ class TriangleNet(nn.Module):
         # where, so that bottleneck throws away the signal the head needs and
         # keeps the one it needs least.
         #
-        # A 4x4 pool keeps the resolution-agnosticism that motivated pooling in
-        # the first place while preserving coarse layout. `pool=1` is kept so
-        # the two can be compared rather than argued about; see
+        # A 4x4 pool keeps the shape-flexibility that motivated pooling in the
+        # first place while preserving coarse layout. `pool=1` is kept so the
+        # two can be compared rather than argued about; see
         # `docs/AMORTIZED.md` for what that comparison found.
         self.pool = nn.AdaptiveAvgPool2d(pool)
 

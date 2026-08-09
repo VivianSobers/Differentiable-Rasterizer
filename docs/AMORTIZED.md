@@ -184,6 +184,73 @@ sees the same global summary. A head that lets each triangle attend to its own
 region — which is what the mirror-response number is really complaining about —
 is the structural change that would follow.
 
+## What scaling actually buys
+
+A five-configuration sweep on an RTX 4090, 5.4 hours, every model graded on one
+held-out benchmark (64 triangles at 96px, 256 images):
+
+| run | tris | train px | width | scenes | margin | gain | refined | steps saved |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| data-40k | 64 | 96 | 32 | 40k | 2.95 | 6.41 | - | - |
+| **data-160k** | 64 | 96 | 32 | 160k | **4.52** | **8.29** | 30.12 | **40** |
+| tris-128 | 128 | 96 | 32 | 40k | 3.55 | 7.64 | **34.85** | 18 |
+| width-64 | 64 | 96 | 64 | 40k | 3.19 | 6.85 | 29.28 | 26 |
+| res-128 | 64 | 128 | 32 | 40k | -0.57 | 2.69 | 28.45 | 8 |
+| big | 128 | 128 | 64 | 160k | -1.17 | 2.51 | 33.87 | 5 |
+
+Reading it needs care, and the first two attempts at this table were both
+misleading — see the section after this one.
+
+**Data dominates.** Against the 40k baseline, one variable at a time: 4x the
+scenes is worth **+1.57 dB** of margin, 2x the triangles +0.60, and 2x the
+width **+0.24**. Width buys almost nothing, which the capacity experiment
+already predicted — the model could reach the fitter's own quality when
+memorizing, so more parameters were never what it was short of.
+
+One caveat that the sweep cannot resolve: these runs held epochs fixed, so 4x
+the scenes was also 4x the gradient steps. "More data" and "more compute" are
+not yet separated. The `diversity` plan exists to do exactly that, holding
+samples and steps identical while varying only how often a scene repeats.
+
+**One-shot quality and refinement quality are different objectives**, and no
+single model wins both. `data-160k` produces the best *starting point* — its
+one-shot prediction is worth 40 fitting iterations. `tris-128` produces the
+best *destination*, 4.7 dB better after 100 steps, while saving less than half
+as many. Triangle count drives where refinement ends up; data drives how good
+the prediction is on its own. If the goal is replacing fitting iterations,
+`data-160k` is the better model despite losing on refined PSNR.
+
+## Two ways of grading that were both wrong
+
+The first version of this table scored each model on a held-out set matching
+its *own* triangle count and resolution. Every model therefore sat a different
+exam: absolute PSNR reflected how hard that model's eval set happened to be,
+the mean-colour baseline moved with it, and the columns could not be compared.
+
+Fixing that — one shared benchmark for everything — introduced the opposite
+problem, and produced the two negative rows above. `res-128` and `big` are the
+only models trained at 128px, and they are the only models scored below the
+baseline. They did not fail. They were graded out of distribution:
+
+| `big`, identical weights | margin |
+| --- | --- |
+| graded at 128px, its training resolution | **+4.44 dB** |
+| graded at 96px, the shared benchmark | **-1.17 dB** |
+
+**5.6 dB lost to a 1.33x change in resolution.** `TriangleNet` pools adaptively
+so that a model trained at one size accepts any other, and the comment
+justifying that said the model could be "trained at 64px and run at 256px". That
+is true about tensor shapes and false about accuracy, which is a distinction the
+architecture's design note did not make and now does.
+
+There is no single fair exam once models are trained at different resolutions.
+The sweep now reports both — `margin` on the shared benchmark and `native` at
+each model's own resolution — because `margin << native` is the signature of a
+model that is fine and does not transfer, and one column cannot show it.
+Whether that transfer gap is a property of the architecture or merely of
+training at a single resolution is what `--plan resolution` and `--sizes` are
+for.
+
 ## Reproducing
 
 ```sh

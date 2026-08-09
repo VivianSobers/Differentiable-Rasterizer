@@ -53,6 +53,8 @@ crates/diffrast-wasm/   WebAssembly bindings
 python/diffrast/        Torch layer, model, datasets, plots
 python/train.py         Distributed training
 python/evaluate.py      Amortized model evaluation, with controls
+python/sweep.py         Concurrent training sweeps, evaluated and tabulated
+python/transfer.py      Generalization across resolution and scene complexity
 web/                    TypeScript viewer
 ```
 
@@ -131,10 +133,20 @@ on its own.
 
 What the pooling actually governs is capacity. Asked to memorize 16 images,
 `pool=4` reaches 27.07 dB against the 27.47 dB a direct fit achieves — it
-matches the optimizer it is imitating — while `pool=1` stalls 2.3 dB short. So
-the model can produce scenes this good; it cannot yet produce the *right* one
-for an image it has not seen. [docs/AMORTIZED.md](docs/AMORTIZED.md) has both
-measurements and the correction.
+matches the optimizer it is imitating — while `pool=1` stalls 2.3 dB short.
+
+So capacity was never the constraint; data was. Trained on 160k synthetic
+scenes the model reaches **8.29 dB of input gain**, beats the flat-colour
+baseline by 4.52 dB, scores 0.90 on the mirror control, and its one-shot
+prediction is worth **40 fitting iterations**. A five-configuration scaling
+sweep puts numbers on which lever matters: 4x the data is worth +1.57 dB of
+margin, 2x the triangles +0.60, and 2x the model width +0.24.
+
+That sweep also found that the model does **not** transfer across resolution —
+5.6 dB lost to a 1.33x change — which contradicted a design note in `model.py`
+about adaptive pooling. [docs/AMORTIZED.md](docs/AMORTIZED.md) has the full
+table, the two different ways of grading it that were both wrong, and the
+correction.
 
 ## Benchmarks
 
