@@ -26,6 +26,25 @@
 //
 // Getting this wrong does not produce a wrong number; it produces a hang or a
 // silently corrupted result on some hardware and not others.
+//
+// ## Early termination, tried and rejected
+//
+// `g` is multiplied by (1 - w) at every triangle, so it decays monotonically
+// front to back, and a pixel whose gradient has gone negligible could skip the
+// rest of its triangles — including `canvas_before`, the O(triangles) call
+// that dominates this shader. The test is free: `g` is a register.
+//
+// Measured at 1e-6 relative cutoff: no change outside noise, at every size in
+// the benchmark. The reason is the scene statistics rather than the idea. With
+// alpha near 0.2 and bounding-box culling, a pixel is covered by roughly 25 of
+// 512 triangles, so `g` reaches only ~1e-3 of its initial value and the
+// threshold never fires. It would pay for dense, opaque scenes; it does not
+// pay for these, and an untaken branch in a barrier-sensitive loop is not
+// worth carrying on speculation.
+//
+// The same check on the CPU was actively *worse* — 2-3% — because there the
+// gradient lives in a canvas-sized buffer and testing it costs a memory read
+// the bounding-box cull would have skipped.
 
 @group(0) @binding(2) var<storage, read> rendered: array<f32>;
 @group(0) @binding(3) var<storage, read> target_image: array<f32>;
