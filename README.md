@@ -58,6 +58,26 @@ python/transfer.py      Generalization across resolution and scene complexity
 web/                    TypeScript viewer
 ```
 
+## The browser viewer
+
+```sh
+cd web
+npm install
+npm run all      # wasm-pack build + tsc
+npm run serve     # http://localhost:8080, since wasm can't load over file://
+```
+
+Verified 2026-08-11: builds clean against the current `Fitter` API (`cargo
+test -p diffrast-wasm`, 9 passing), and actually runs — driven headlessly with
+a real Chrome instance over the DevTools protocol rather than just checked for
+a successful compile, since a page that builds can still fail silently at
+runtime. WebAssembly loaded, `status` went from `loading WebAssembly…` to
+`ready — press Start`, and clicking Start drove the fit for real: iteration
+32 -> 76 and loss 2.55e-3 -> 1.90e-3 over six seconds, zero console errors.
+`stepping_matches_the_batch_loop` (in `crates/diffrast/src/fit.rs`) still pins
+the viewer's incremental per-frame path to the CLI's batch loop, so they can't
+drift apart silently.
+
 ## Training through the renderer
 
 The rasterizer is exposed to PyTorch as an ordinary differentiable op, so a
