@@ -24,7 +24,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r python/requirements.txt maturin torch
 (cd crates/diffrast-py && maturin develop --release)
 
-python -m unittest discover -s python -p "test_*.py"   # expect 61 passing
+python -m unittest discover -s python -p "test_*.py"   # expect 65 passing
 ```
 
 If `gpu_bench` reports a Vulkan adapter that is not the 4090, force it:
@@ -181,48 +181,57 @@ Other plans: `data` (10k/40k/160k scenes), `model` (width 32/64/96),
 
 ## 4. What to send back
 
-Three things, in order of usefulness:
+Updated after a session that ran most of the outstanding items on this list
+directly. What follows is what is genuinely still open, not the original ask.
 
-1. `docs/gpu-report.txt` from `scripts/collect-gpu-report.sh`. The GPU work is
-   done for now — the crossover favours the 4090 in all nine cells and a
-   backward call at 256px is 61% dispatch — so this is a regression check
-   rather than an investigation. Worth a fresh run whenever the shaders change,
-   and worth re-reading `crossover` if `prefer_gpu`'s thresholds are touched:
-   `test_policy_matches_the_discrete_crossover` pins that table and has to move
-   with it.
-2. **The output of `evaluate.py`** — now the most useful thing on this list,
-   and the reason to run training at all. `history.json` shows the loss going
-   down, which turns out not to be evidence of anything: a model that ignores
-   its input entirely also drives that loss down. See
-   [AMORTIZED.md](AMORTIZED.md).
+**Closed this session**, each with a full writeup in
+[AMORTIZED.md](AMORTIZED.md):
 
-   A real run, and its evaluation:
+- The data/compute/triangle/width scaling sweep — data saturates around 160k
+  scenes, compute is worth about half of data, width is worth almost nothing.
+  Re-running any of these levers wastes the card; they are spent.
+- Resolution transfer, both whether it needs training (yes) and whether
+  `--sizes` jitter closes the gap once trained (no — narrows it, does not
+  close it, at any width tested including 48-160px).
+- Real photographs (`ImageFolderDataset` + `precompute.py` + `--pretrain`),
+  never exercised before this session. The model generalizes off its own
+  generator — margin and gain are the highest recorded anywhere in this
+  project on 40k STL-10 photos — but mirror response drops to ~0.59 from
+  ~0.90 on synthetic, meaning it leans more on colour and less on layout to
+  do it.
+- The supervised warm start's actual payoff: pretrain-then-finetune reaches
+  92.7% of from-scratch margin for 1.53x less wall-clock, and is not behind
+  scratch at all after 100 refinement steps. Getting a clean measurement of
+  it surfaced two real bugs (a `--resume` that silently fine-tuned for zero
+  epochs; a `--triangles` default that crashed a fine-tune with a checkpoint
+  size mismatch), both fixed.
+- The browser viewer, unverified since the GPU and model work landed — builds
+  clean and now confirmed to actually run: driven headlessly through Chrome's
+  DevTools protocol, not just checked for a successful compile.
 
-   ```sh
-   python python/train.py --synthetic --epochs 60 --synthetic-size 40000 \
-       --batch 64 --triangles 64 --size 96 --width 48 --pool 4 \
-       --render-fraction 1.0 --raster-device auto --out runs/pool4
+**Still open:**
 
-   python python/evaluate.py --checkpoint runs/pool4/best.pt --synthetic \
-       --count 256 --refine-steps 100 --out runs/pool4/eval.json
-   ```
-
-   `--render-fraction 1.0` is now the default without `--pretrain`, but pass it
-   explicitly — an earlier default of 0.25 discarded three quarters of every
-   batch here and invalidated a local experiment before it was caught.
-
-   **The two numbers to read** are `input gain` and whether one-shot PSNR
-   clears the mean-colour baseline. Locally they were 3.62 dB and *no*, losing
-   by 0.17 dB. The capacity test says this is a generalization gap rather than
-   a representational limit — the same model memorizes 16 images to within
-   0.4 dB of what a direct fit achieves — so more data at higher resolution is
-   the treatment, and this run is the test of it.
-
-   Read the result against **27.5 dB**, not against perfection: that is what a
-   long direct fit reaches on this data, and no predictor should be expected to
-   beat the optimizer it is imitating.
-
-   The `--pool 1` arm is optional and lower value now. It costs the same run
-   again to confirm a 2.3 dB capacity gap already measured locally.
-3. Peak GPU memory during training (`nvidia-smi` during a run) — tells us how
-   much headroom there is for larger batches or more triangles.
+1. **The mirror-response gap on real photos** (~0.59-0.60, against ~0.90 on
+   synthetic) has no diagnosis yet, only a hypothesis: the head reads one
+   flat pooled vector and emits every triangle from it, so a triangle has no
+   way to attend to its own region — exactly what a low mirror response
+   would predict, and exactly the structural change [AMORTIZED.md] proposed
+   before real photos were ever tried. Worth testing directly now that there
+   is a real-photo benchmark to test it against, rather than only a synthetic
+   one that never exposed the problem this clearly.
+2. **`precompute.py`'s `--size` default (64px) does not match the resolution
+   used everywhere else in this project (96px)**, and it went unnoticed until
+   grading a pretrain checkpoint at 96px cost 3.28 dB of margin that had
+   nothing to do with the pretrain approach itself. Either change the
+   default or make `train.py --pretrain` warn when the stored image size
+   disagrees with `--size`.
+3. **The real-photo corpus was run at synthetic-experiment scale** (40k
+   images, 60 epochs, 64 triangles, 96px) to fit inside a session, not
+   because that is where photos saturate. Whether photos follow the same
+   data/compute curve as synthetic scenes — a real knee around 160k, compute
+   worth half of data — has not been measured and might not even hold, since
+   photos are a fixed corpus rather than an infinite generator.
+4. `docs/gpu-report.txt` from `scripts/collect-gpu-report.sh` is a regression
+   check now, not an investigation — the crossover favours the 4090 in every
+   cell and a backward call at 256px is dispatch-dominated. Worth a fresh run
+   whenever the shaders change; not worth investigating further on its own.
