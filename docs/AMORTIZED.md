@@ -499,6 +499,59 @@ that it does so primarily by understanding spatial layout is weaker on real
 photographs than the synthetic numbers suggested, and this section is the
 correction.
 
+## Does the supervised warm start actually pay for itself?
+
+`--pretrain` trains against `precompute.py`'s fits with no rasterizer in the
+training loop, documented as the way to "get most of the way, then fine-tune
+end-to-end" — a claim that had never been evaluated with controls before this
+session. Three arms, all evaluated at the same 96px on the same 40k STL-10
+photos as the section above, so the numbers are comparable:
+
+| arm | wall-clock | margin | gain | mirror | one-shot | refined (100 steps) |
+| --- | --- | --- | --- | --- | --- | --- |
+| scratch (60 epochs) | 553.8s | **5.88** | **9.20** | 0.59 | **19.23** | 23.50 |
+| pretrain only (60 epochs) | **145.4s** | 2.00 | 4.39 | 0.60 | 15.35 | 23.39 |
+| pretrain + finetune (20 epochs) | 362.8s | 5.45 | 8.69 | 0.60 | 18.80 | **23.62** |
+
+**It pays for itself.** Pretrain-then-finetune reaches 92.7% of scratch's
+margin and 97.8% of its one-shot PSNR for 1.53x less total wall-clock
+(362.8s against 553.8s), and after 100 refinement steps it is not behind
+scratch at all — 23.62 dB against 23.50 dB, the best number in the table. The
+same pattern from the synthetic scaling sweep shows up again: refinement
+narrows the gap between a better and a worse starting point far more than it
+preserves it.
+
+The pretrain-only row needs a caveat before it looks worse than it is:
+`precompute.py` stored its fit images at its default 64px, not the 96px this
+table grades on, so this row is evaluated 1.5x out of the resolution the model
+actually trained at. Graded at its native 64px instead, pretrain-only scores
+**5.28 dB margin, 8.52 dB gain, 18.78 dB one-shot** — competitive with scratch,
+not far behind it, for a quarter of the wall-clock. The 3.28 dB of margin lost
+by grading it at 96px (5.28 -> 2.00) is the same resolution-transfer tax
+measured in the section above on synthetic scenes, showing up again on a real
+photo/pretrain pipeline. The lesson isn't about pretraining specifically — it's
+that `--fit-size` and `--size` need to agree with whatever resolution the
+model will actually run at, and `precompute.py`'s default silently didn't.
+
+Fine-tuning recovers essentially all of that gap in 217.4s (20 epochs at 96px)
+— evidence that the warm start's real value is giving the end-to-end phase a
+much better starting point, not that the warm start alone is resolution-robust.
+
+**A real bug surfaced getting this table**, worth recording because it made a
+documented workflow silently do nothing: the RUNBOOK's fine-tuning example
+used `--resume` to continue from the pretrain checkpoint. `--resume` restores
+the optimizer and OneCycle schedule as well as the weights, both defined over
+the checkpoint's own step count — and the pretrain run had already completed
+every step of *its* schedule, so `--resume` found nothing left to anneal and
+fine-tuned for zero epochs, producing `runs/finetune` from a resumed-but-frozen
+copy of the pretrain weights rather than genuinely fine-tuning them. A second,
+independent bug in the very first fine-tune attempt this session — omitting
+`--triangles 64` let it default to 128, size-mismatching the checkpoint's head
+layer and crashing immediately — is further evidence this path had never
+actually been run end to end before. `train.py` now has `--init-from`, which
+loads only the weights and starts a fresh optimizer, schedule and epoch
+counter for the new phase; `docs/RUNBOOK.md` is corrected to use it.
+
 ## Reproducing
 
 ```sh

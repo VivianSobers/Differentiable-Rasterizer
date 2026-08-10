@@ -200,6 +200,14 @@ statistics and less on precise spatial layout to do it than it does on
 procedurally generated triangle scenes. [docs/AMORTIZED.md](docs/AMORTIZED.md)
 has the full writeup.
 
+The `--pretrain` warm start pays for itself: pretrain-then-finetune on the same
+photos reaches 92.7% of from-scratch margin and matches it after refinement
+(23.62 dB against 23.50 dB) for **1.53x less wall-clock** (362.8s against
+553.8s). Getting a clean measurement of it surfaced two real bugs — a
+`--resume` that silently fine-tuned for zero epochs, and a default that
+size-mismatched a checkpoint's head layer — both fixed; see
+[docs/AMORTIZED.md](docs/AMORTIZED.md) for the table and the postmortem.
+
 ## Benchmarks
 
 Measured on 16 cores with `cargo bench`:
