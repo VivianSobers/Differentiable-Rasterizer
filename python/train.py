@@ -244,6 +244,18 @@ def main() -> int:
         next(iter(loader))
 
     model = TriangleNet(triangles=triangles, width=args.width, pool=args.pool).to(device)
+    if args.init_from:
+        # A warm start into a *new* training phase — different data, often a
+        # different epoch count — not a resumed run of the same one. `--resume`
+        # cannot do this: it restores the optimizer and OneCycle schedule too,
+        # both defined over the checkpoint's own step count, and a schedule
+        # already at the end of its cycle has nothing left to anneal. This
+        # loads only the weights and leaves the epoch counter, optimizer and
+        # schedule to start fresh for the new run.
+        blob = torch.load(args.init_from, map_location=device, weights_only=False)
+        model.load_state_dict(blob["model"])
+        if is_main:
+            print(f"initialized weights from {args.init_from}")
     if is_main:
         print(f"model: {count_parameters(model):,} parameters, {triangles} triangles")
         print(f"data:  {len(dataset):,} items, batch {args.batch} x {world_size} rank(s)")
@@ -464,6 +476,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out", default="runs/amortized")
     p.add_argument("--resume", help="continue from a checkpoint written by a previous run")
+    p.add_argument(
+        "--init-from",
+        help="load model weights from a checkpoint as a warm start for a new "
+        "training phase, e.g. --pretrain followed by end-to-end fine-tuning; "
+        "unlike --resume this does not restore the optimizer, schedule or "
+        "epoch counter",
+    )
 
     p.add_argument("--sigma-start", type=float, default=0.02)
     p.add_argument("--sigma-end", type=float, default=0.003)
@@ -500,6 +519,8 @@ def parse_args() -> argparse.Namespace:
         args.render_fraction = 0.25 if args.pretrain else 1.0
     if not 0 < args.render_fraction <= 1:
         p.error("--render-fraction must be in (0, 1]")
+    if args.resume and args.init_from:
+        p.error("--resume and --init-from are mutually exclusive")
     args.param_weight_initial = args.param_weight
     return args
 
