@@ -176,9 +176,29 @@ margin, 2x the triangles +0.60, and 2x the model width +0.24.
 
 That sweep also found that the model does **not** transfer across resolution —
 5.6 dB lost to a 1.33x change — which contradicted a design note in `model.py`
-about adaptive pooling. [docs/AMORTIZED.md](docs/AMORTIZED.md) has the full
-table, the two different ways of grading it that were both wrong, and the
-correction.
+about adaptive pooling. Training across resolutions (`--sizes`) narrows that
+gap but does not close it: every arm tested, including a 48-160px jitter,
+still loses to a flat colour fill away from its training resolution.
+[docs/AMORTIZED.md](docs/AMORTIZED.md) has the full table, the two different
+ways of grading it that were both wrong, and the correction.
+
+**Every number above is about inverting the same rasterizer the model was
+trained against** — real but self-referential, since the "images" are scenes
+the renderer itself produced. The first test against data the model never
+rendered: 40k STL-10 photographs at 96px, otherwise identical training (60
+epochs, 64 triangles, width 32, pool 4). One-shot PSNR is lower, as expected —
+a photo is not exactly representable by 64 triangles (19.23 dB, against 21.90
+dB on the best synthetic benchmark run) — but margin and input gain are the
+two highest recorded anywhere in this project: **5.88 dB** of margin, **9.20
+dB** of input gain, both above every synthetic configuration measured. The
+predicted mean-colour baseline did not hold either: photos scored a *weaker*
+baseline (13.35 dB) than synthetic scenes (18.68 dB), the opposite of what was
+expected going in. What did not transfer cleanly is mirror response, which
+fell to **0.59** from 0.87-0.92 on every synthetic configuration — the model
+beats a flat colour fill soundly on real photographs, but leans more on colour
+statistics and less on precise spatial layout to do it than it does on
+procedurally generated triangle scenes. [docs/AMORTIZED.md](docs/AMORTIZED.md)
+has the full writeup.
 
 ## Benchmarks
 

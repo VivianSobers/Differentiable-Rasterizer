@@ -418,6 +418,87 @@ Whether that transfer gap is a property of the architecture or merely of
 training at a single resolution is what `--plan resolution` and `--sizes` are
 for.
 
+## Real photographs, not self-generated scenes
+
+Every result above is measured on synthetic triangle scenes, rendered by the
+same rasterizer the model is trained against. That makes every claim so far
+about *inverting a renderer* — a controlled, verifiable task, but a
+self-referential one. `ImageFolderDataset`, `precompute.py` and `--pretrain`
+exist specifically to test the harder claim — approximating an *image*, not a
+scene this renderer already knows how to produce — and had never been run
+before this session.
+
+**The corpus.** STL-10's unlabeled split, chosen because it is 96x96 already
+(the training resolution used throughout this project, no resize needed) and
+downloads through torchvision with no manual collection. 40,000 images
+exported to PNG via `python/export_stl10.py`, so the existing, tested
+`ImageFolderDataset` path runs completely unchanged.
+
+**How to read this table honestly, decided in advance of running it:** absolute
+PSNR will be *lower* than synthetic, because a photograph is not exactly
+representable by 64 triangles the way a 64-triangle synthetic scene is by
+construction. The mean-colour baseline was expected to be *stronger*, on the
+theory that photos are smoother than random triangle placements — that
+prediction turned out to be wrong, which is exactly why the controls exist
+rather than eyeballing PSNR. What actually matters is `margin_db` (beats a
+flat colour fill or it doesn't), `input_gain_db` (reads the input or doesn't),
+and `mirror_response` (spatially aware or colour-only).
+
+Trained 60 epochs on the 40k photos, 64 triangles, width 32, pool 4 — otherwise
+identical to the synthetic runs above — and evaluated on 256 held-out photos:
+
+| | synthetic (best, data-160k) | photos |
+| --- | --- | --- |
+| one-shot PSNR | 21.90 | 19.23 |
+| mean-colour baseline | 18.68 | **13.35** |
+| margin | 4.56 | **5.88** |
+| input gain | 8.29 | **9.20** |
+| mirror response | 0.90 | **0.59** |
+| refined (100 steps) | 30.12 | 23.50 |
+| steps saved | 40 | 22 |
+
+**Verdict: `learned a real mapping`.** Margin is positive and, in fact, the
+highest recorded anywhere in this project — 5.88 dB, ahead of every synthetic
+configuration measured, including the 160k-scene scaling-sweep winner. Input
+gain is likewise the highest recorded, 9.20 dB. The method generalizes off its
+own generator; this is not a model that only knows how to invert itself.
+
+Two predictions from the "how to read this" paragraph above did not survive
+contact with the data, and both are worth recording rather than quietly
+dropping:
+
+**The mean-colour baseline is *weaker* on photos, not stronger** — 13.35 dB
+against 18.68 dB on synthetic scenes. The reasoning going in was that photos
+are smoother than randomly placed triangles. Measured, it is the opposite:
+STL-10's images are diverse natural photographs (animals, vehicles, ships)
+whose average colour is a worse single-colour summary than the average colour
+of a 64-triangle scene built from a handful of large, flat regions. A weaker
+baseline is also *part of* why margin came out so high — margin is measured
+against this baseline, and it moved in the model's favour for a reason that
+has nothing to do with the model.
+
+**Mirror response fell to 0.59**, down from 0.87-0.92 on every synthetic
+configuration measured this project. Mirroring a real photo leaves its colour
+statistics untouched and demands every triangle move to track the flipped
+layout — exactly as it does for a synthetic scene — so a lower ratio means the
+model leans more on colour and less on precise spatial placement to predict a
+photo than it does for a procedurally generated one. That is a real
+difference in *how* the model is generalizing, not just *how well*: photos
+carry far more usable signal in colour and texture statistics than a
+randomly-coloured synthetic scene does, so a model chasing PSNR has less
+incentive to nail layout precisely when colour alone already buys it a lot of
+the score. High margin and gain say the method works on images it did not
+generate; a mirror response nearly half of the synthetic figure says it is
+not working the same way it does on synthetic scenes, and the difference is
+attributable to what real images offer a model that is willing to cheat on
+layout in favour of colour.
+
+Read together: the headline claim in the README — that this predicts triangle
+scenes from images, not just from self-generated ones — holds. The finer claim
+that it does so primarily by understanding spatial layout is weaker on real
+photographs than the synthetic numbers suggested, and this section is the
+correction.
+
 ## Reproducing
 
 ```sh
