@@ -113,9 +113,19 @@ After the supervised warm start, fine-tune through the rasterizer:
 ```sh
 torchrun --nproc_per_node=2 python/train.py \
   --data /path/to/images --epochs 20 \
+  --init-from runs/pretrain/best.pt \
   --param-weight 0 --raster-device auto \
   --out runs/finetune
 ```
+
+`--init-from`, not `--resume` — this loads the pretrained weights as a warm
+start for a new training phase and nothing else. `--resume` restores the
+optimizer and OneCycle schedule too, both defined over the checkpoint's own
+step count; the pretrain run already completed every step of *its* schedule,
+so resuming into it finds nothing left to anneal and fine-tunes for zero
+epochs. This distinction was not academic: the command above used to omit
+`--init-from` entirely, silently fine-tuning a freshly initialized model
+instead of the pretrained one.
 
 `--param-weight 0` removes the parameter-supervision term, which means the
 render loss is the only loss — so leave `--render-fraction` at its default of
