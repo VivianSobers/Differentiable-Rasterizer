@@ -268,6 +268,56 @@ random initialization, and a good initialization is exactly what it damages.
 Two of the ~40 saved iterations are spent undoing that, and nothing has tried
 lowering the rate when starting from a prediction.
 
+## Does resolution invariance have to be trained?
+
+Not answered yet, and the first attempt was invalid — worth recording because
+the failure was in the harness rather than the idea.
+
+| trained at | margin | gain | one-shot |
+| --- | --- | --- | --- |
+| fixed 96px | 1.96 | 5.60 | 20.64 |
+| jitter 64/96/128 | **-0.37** | 2.88 | 18.31 |
+| jitter 48-160 | 1.98 | 5.56 | 20.66 |
+
+Wider jitter matching no jitter while *narrower* jitter collapses is not a
+curve, it is noise — and the cause is `best.pt`. Model selection compared each
+epoch's training loss against the others', which assumes they are on the same
+scale. Under `--sizes` they are not: every epoch trains at a different
+resolution and MSE is not comparable across them, so the saved checkpoint was
+chosen by whichever resolution happened to score lowest.
+
+Selection now runs on a held-out set at one fixed resolution. The effect is
+visible immediately on a four-epoch smoke test: the final epoch had the lowest
+*training* loss and a worse held-out loss than the epoch before it, so the two
+criteria disagree about which checkpoint to keep.
+
+The experiment needs re-running before it says anything. What can already be
+said is that a model trained at one resolution does not transfer, and that
+none of these three managed to beat a flat colour fill by more than 2 dB —
+against 4.56 dB for the best fixed-resolution model on more data.
+
+## Refinement rate: hypothesis rejected
+
+Every refinement trace loses ground on its first step — 23.23 -> 22.21 before
+recovering by step 3 — which looked like Adam at `lr=0.02` being tuned for a
+random start and damaging a good one. Swept on the best model, 100 steps:
+
+| lr | from prediction | from random |
+| --- | --- | --- |
+| 0.05 | 28.12 | 25.19 |
+| **0.02** | **30.31** | 25.58 |
+| 0.01 | 29.99 | 24.75 |
+| 0.005 | 29.42 | 23.56 |
+
+The default was already the best of the four. The first-step dip is real and
+costs about two iterations, and every rate that avoids it costs more than that
+in convergence. Nothing to fix.
+
+Worth noting how the "steps saved" metric misleads here: it *rises* to 89 at
+`lr=0.005`, which looks like a better head start and is nothing of the kind —
+the random baseline slowed down too. That number is only comparable at a fixed
+learning rate.
+
 ## Two ways of grading that were both wrong
 
 The first version of this table scored each model on a held-out set matching
