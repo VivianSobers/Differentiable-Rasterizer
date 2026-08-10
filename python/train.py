@@ -102,6 +102,27 @@ def build_dataset(args):
     return ImageFolderDataset(args.data, size=args.size, limit=args.limit)
 
 
+@torch.no_grad()
+def validation_score(model, images: torch.Tensor, sigma: float, args, device) -> float:
+    """Photometric loss on a fixed held-out set, at one fixed resolution.
+
+    Model selection compares one epoch's loss against another's, which silently
+    assumes they are on the same scale. With `--sizes` they are not: each epoch
+    trains at a different resolution and MSE is not comparable across them, so
+    `best.pt` ends up chosen by whichever resolution happened to score lowest
+    rather than by which model is better.
+
+    This is also a genuinely held-out set, unlike the training loss it
+    replaces — a distinct seed, never trained on.
+    """
+    was_training = model.training
+    model.eval()
+    images = images.to(device, non_blocking=True)
+    score = fused_mse(model(images), images, sigma=sigma, device=args.raster_device).item()
+    model.train(was_training)
+    return score
+
+
 def train_step(
     model, batch, args, sigma: float, device: torch.device
 ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -222,6 +243,17 @@ def main() -> int:
     if is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Only built when resolutions vary, because that is the case where the
+    # training loss stops being a usable selection signal.
+    validation = None
+    if args.sizes:
+        val_set = SyntheticShapeDataset(
+            length=args.val_size, size=args.size, triangles=triangles, seed=9973
+        )
+        validation = torch.stack([val_set[i] for i in range(args.val_size)])
+        if is_main:
+            print(f"validation: {args.val_size} held-out scenes at {args.size}px")
+
     history: list[dict] = []
     best = math.inf
     first_epoch = 0
@@ -322,7 +354,13 @@ def main() -> int:
             summary = "  ".join(f"{k} {v:.5f}" for k, v in means.items())
             print(f"epoch {epoch:>3}  sigma {sigma:.4f}  {summary}  ({elapsed:.1f}s)")
 
-            score = means.get("render_loss", means.get("loss", math.inf))
+            score = (
+                validation_score(model, validation, sigma, args, device)
+                if validation is not None
+                else means.get("render_loss", means.get("loss", math.inf))
+            )
+            if validation is not None:
+                record["val_loss"] = score
             improved = score < best
             if improved:
                 best = score
@@ -395,6 +433,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--limit", type=int, default=None, help="cap dataset size")
     p.add_argument("--synthetic-size", type=int, default=20_000)
+    p.add_argument(
+        "--val-size",
+        type=int,
+        default=256,
+        help="held-out scenes used for model selection when --sizes varies the "
+        "training resolution",
+    )
     p.add_argument("--out", default="runs/amortized")
     p.add_argument("--resume", help="continue from a checkpoint written by a previous run")
 
