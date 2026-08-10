@@ -1,0 +1,222 @@
+diffrast GPU report
+date:   2026-08-11T02:07:39+05:30
+commit: f6b110b
+host:   Linux 6.8.0-136-generic x86_64
+
+===== CPU =====
+cores: 26
+13th Gen Intel(R) Core(TM) i9-13900
+
+===== GPU =====
+0, NVIDIA GeForce RTX 4090, 24564 MiB, 132 MiB, 0 %, 535.309.01
+-- processes currently using the GPU --
+
+===== Toolchain =====
+rustc 1.93.0 (254b59607 2026-01-19)
+cargo 1.93.0 (083ac5135 2025-12-15)
+Python 3.10.12
+
+===== Build =====
+(build ok, 24s)
+
+===== Tests (CPU only) =====
+
+test canvas::tests::fit_within_preserves_aspect_and_never_upscales ... ok
+test canvas::tests::get_and_set_address_the_right_pixel ... ok
+test canvas::tests::mse_is_zero_against_itself_and_positive_otherwise ... ok
+test canvas::tests::out_of_range_values_are_clamped_when_encoding ... ok
+test canvas::tests::srgb_round_trips_through_encode_decode ... ok
+test fit::tests::fitter_rejects_invalid_config ... ok
+test fit::tests::invalid_configs_are_rejected ... ok
+test fit::tests::fitter_exposes_live_state ... ok
+test fit::tests::projection_keeps_parameters_in_range ... ok
+test fit::tests::projection_replaces_non_finite_parameters ... ok
+test fit::tests::sigma_anneals_from_start_to_end ... ok
+test fit::tests::single_iteration_config_uses_final_sigma ... ok
+test fit::tests::patience_stops_a_stalled_fit_early ... ok
+test fit::tests::stepping_past_the_end_returns_none ... ok
+test fit::tests::zero_iterations_is_not_an_error ... ok
+test fit::tests::progress_callback_reports_every_iteration ... ok
+test grad::tests::culled_triangle_contributes_no_gradient ... ok
+test grad::tests::mismatched_batch_sizes_panic - should panic ... ok
+test grad::tests::clamped_alpha_receives_no_gradient ... ok
+test optim::tests::per_parameter_rates_are_respected ... ok
+test optim::tests::zero_gradient_leaves_params_untouched ... ok
+test optim::tests::descends_a_quadratic ... ok
+test raster::tests::centroid_is_inside_and_far_corner_is_outside ... ok
+test raster::tests::coverage_is_half_on_the_edge ... ok
+test raster::tests::offscreen_triangle_is_culled ... ok
+test raster::tests::coverage_saturates_away_from_the_edge ... ok
+test grad::tests::tape_render_matches_plain_render ... ok
+test raster::tests::winding_order_does_not_matter ... ok
+test serial::tests::empty_scene_is_still_valid_json ... ok
+test serial::tests::non_finite_values_never_reach_the_output ... ok
+test raster::tests::opaque_triangle_paints_over_background ... ok
+test serial::tests::triangle_count_matches_separator_count ... ok
+test raster::tests::params_round_trip ... ok
+test serial::tests::emits_expected_fields ... ok
+test grad::tests::zero_loss_gives_zero_gradient ... ok
+test grad::tests::color_gradient_is_exact_for_a_single_triangle ... ok
+test grad::tests::batch_preserves_input_order ... ok
+test grad::tests::batch_render_matches_sequential_render ... ok
+test fit::tests::non_square_targets_are_fitted_without_cropping ... ok
+test grad::tests::batch_gradients_match_sequential_ones ... ok
+test fit::tests::stepping_matches_the_batch_loop ... ok
+test grad::tests::analytic_gradient_matches_finite_differences ... ok
+test fit::tests::fitting_is_deterministic_for_a_fixed_seed ... ok
+test fit::tests::best_scene_is_returned_not_the_last ... ok
+test fit::tests::loss_decreases_on_a_synthetic_target ... ok
+
+
+
+
+
+
+
+
+
+test empty_scene_renders_the_background ... ok
+test fit_within_matches_documented_behavior ... ok
+test loading_a_missing_file_is_an_error_not_a_panic ... ok
+test gradient_points_downhill ... ok
+test png_round_trips_through_disk ... ok
+test taped_render_matches_plain_render_at_several_sizes ... ok
+test render_is_deterministic ... ok
+test non_square_and_tiny_canvases_are_handled ... ok
+test exported_scene_json_is_well_formed ... ok
+test fitted_scene_upscales_without_refitting ... ok
+test fit_reduces_loss_substantially ... ok
+
+
+   Doc-tests diffrast
+
+
+
+(cpu tests ok, 0s)
+
+===== Tests (GPU) =====
+
+test tests::backward_gradient_points_downhill ... gpu: NVIDIA GeForce RTX 4090 (Vulkan)
+ok
+test tests::backward_matches_cpu ... ok
+test tests::batch_preserves_order ... ok
+test tests::batched_backward_matches_cpu ... ok
+test tests::batched_render_matches_cpu ... ok
+test tests::batched_render_matches_single_renders ... ok
+test tests::both_backward_modes_agree ... ok
+test tests::buffers_are_reused_across_identical_calls ... ok
+test tests::device_side_loss_matches_a_host_reduction ... ok
+test tests::empty_batch_is_empty_not_an_error ... ok
+test tests::empty_scene_renders_background ... ok
+test tests::forward_matches_cpu ... ok
+test tests::gradient_input_mode_matches_target_mode ... ok
+test tests::gradient_input_rejects_wrong_length ... ok
+test tests::mismatched_target_sizes_are_rejected ... ok
+test tests::ragged_batches_are_rejected ... ok
+test tests::reduce_modes_agree ... ok
+test tests::tape_size_is_reported ... ok
+test tests::taped_mode_matches_cpu_too ... ok
+test tests::workgroup_reduction_handles_non_multiple_sizes ... ok
+test tests::workgroup_reduction_matches_cpu ... ok
+
+
+
+
+
+   Doc-tests diffrast_gpu
+
+
+
+(gpu tests ok, 25s)
+
+===== CPU benchmarks =====
+
+=== forward render ===
+render 128x128, 64 triangles                         477.4 us   (838 runs)
+render 128x128, 256 triangles                         2.22 ms   (180 runs)
+render 256x256, 64 triangles                          1.65 ms   (243 runs)
+render 256x256, 256 triangles                         7.15 ms   (56 runs)
+render 512x512, 64 triangles                          6.10 ms   (66 runs)
+render 512x512, 256 triangles                        26.04 ms   (16 runs)
+
+=== forward + backward (one fit iteration) ===
+fwd+bwd 128x128, 64 triangles                         3.02 ms   (133 runs)
+fwd+bwd 128x128, 256 triangles                       11.80 ms   (34 runs)
+fwd+bwd 256x256, 64 triangles                        10.68 ms   (38 runs)
+fwd+bwd 256x256, 256 triangles                       48.25 ms   (9 runs)
+
+=== tape memory ===
+tape for 64 triangles at 256x256                     3235 KB  (vs 49152 KB storing full canvases, 15x less)
+tape for 256 triangles at 256x256                   13281 KB  (vs 196608 KB storing full canvases, 15x less)
+tape for 1024 triangles at 256x256                  51361 KB  (vs 786432 KB storing full canvases, 15x less)
+
+=== batch scaling (parallel across items) ===
+backward_batch of 1 (128x128, 64 tris)                2.94 ms   (137 runs)
+backward_batch of 4 (128x128, 64 tris)                5.51 ms   (73 runs)
+backward_batch of 16 (128x128, 64 tris)               7.32 ms   (55 runs)
+backward_batch of 64 (128x128, 64 tris)              22.58 ms   (18 runs)
+
+(divide batch timings by the batch size to compare per-item cost)
+(cpu bench ok, 7s)
+
+===== GPU benchmarks =====
+adapter: NVIDIA GeForce RTX 4090 (Vulkan)
+
+forward                             cpu        gpu   speedup  max diff
+128x128, 64 tris                  0.55ms      0.13ms      4.2x  6.26e-7
+256x256, 128 tris                 3.69ms      0.21ms     17.4x  8.05e-7
+512x512, 256 tris                25.83ms      0.75ms     34.6x  1.07e-6
+512x512, 1024 tris               99.87ms      1.30ms     76.9x  8.64e-7
+
+forward + backward                  cpu  gpu taped gpu recomp      best  grad rel err
+128x128, 64 tris                  2.91ms      2.22ms      2.22ms      1.3x  2.50e-6   (tape would be 12 MB)
+256x256, 128 tris                22.72ms     16.64ms     14.79ms      1.5x  9.98e-5   (tape would be 96 MB)
+256x256, 512 tris                92.39ms     31.42ms     21.64ms      4.3x  2.13e-5   (tape would be 384 MB)
+
+batched backward (128px)       cpu rayon  gpu 1-by-1 gpu batched batch win
+batch 8, 64 tris                   6.26ms      16.73ms       0.96ms     17.4x
+batch 32, 64 tris                 11.58ms      67.01ms       2.70ms     24.8x
+batch 64, 64 tris                 22.04ms     178.00ms       5.12ms     34.8x
+
+=== crossover: CPU rayon vs GPU batched (batch of 16) ===
+per-item work                    cpu rayon  gpu batched    gpu/cpu  winner
+64x64, 32 tris                       0.84ms        0.39ms      2.12x  GPU
+64x64, 128 tris                      3.55ms        1.05ms      3.37x  GPU
+64x64, 512 tris                     15.77ms        6.68ms      2.36x  GPU
+128x128, 32 tris                     3.19ms        1.10ms      2.91x  GPU
+128x128, 128 tris                   13.59ms        2.69ms      5.04x  GPU
+128x128, 512 tris                   58.60ms       14.20ms      4.13x  GPU
+256x256, 32 tris                    12.50ms        3.30ms      3.79x  GPU
+256x256, 128 tris                   55.04ms        8.96ms      6.14x  GPU
+256x256, 512 tris                  238.92ms       70.64ms      3.38x  GPU
+
+=== gradient reduction: global atomics vs workgroup reduction (batch of 16) ===
+per-item work                        direct     workgroup    speedup
+64x64, 32 tris                        0.95ms         0.44ms      2.13x
+64x64, 128 tris                       2.08ms         1.09ms      1.91x
+64x64, 512 tris                       7.79ms         6.56ms      1.19x
+128x128, 32 tris                      5.27ms         0.98ms      5.35x
+128x128, 128 tris                     9.47ms         2.71ms      3.49x
+128x128, 512 tris                    25.93ms        14.25ms      1.82x
+256x256, 32 tris                     66.89ms         3.31ms     20.23x
+256x256, 128 tris                    87.33ms         8.97ms      9.74x
+256x256, 512 tris                   169.18ms        42.46ms      3.98x
+
+=== phase breakdown of backward_many (batch of 16, 32 triangles) ===
+resolution        pack     alloc    dispatch   readback      loss      total
+64x64            0.02ms     0.09ms       0.28ms      0.04ms     0.00ms      0.42ms
+128x128          0.03ms     0.33ms       0.69ms      0.05ms     0.00ms      1.10ms
+256x256          0.02ms     1.20ms       2.04ms      0.04ms     0.00ms      3.30ms
+pool after the breakdown: PoolStats { hits: 1745, misses: 31, bytes: 54207056 }
+
+note: the breakdown waits for the queue between phases so each one
+measures its own work, which makes its total an upper bound — compare
+phases against each other, not this total against the tables above.
+The crossover table is the one to read before choosing a device.
+(gpu bench ok, 29s)
+
+===== notes =====
+stage timeout: 600s (override with STAGE_TIMEOUT=...)
+If a GPU stage timed out, check the process list above — a card shared
+with another job will queue our submissions behind it. Re-run with
+SKIP_GPU=1 to collect the CPU numbers regardless.
