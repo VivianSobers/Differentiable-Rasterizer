@@ -296,6 +296,75 @@ said is that a model trained at one resolution does not transfer, and that
 none of these three managed to beat a flat colour fill by more than 2 dB —
 against 4.56 dB for the best fixed-resolution model on more data.
 
+### The re-run
+
+Selection now runs on a held-out set at one fixed resolution (`42a86e6`). Along
+the way, re-running `--sizes` with workers also surfaced a second, unrelated
+bug: `--sizes` needs a resolution change to reach already-forked DataLoader
+workers, and the only mechanism the old code had for that was
+`persistent_workers=False`, re-forking every epoch. By the time that happens
+the main process has already used the GPU rasterizer — every training step
+does — and forking after that deadlocks the child on a lock the parent's
+now-absent thread was holding. `--workers 0` never hit it; `--workers 4` hung
+on the very first batch, reproduced twice on a smoke test, and is fixed
+(`1e9f2ce`) by forking workers exactly once, before anything touches the GPU,
+and passing per-epoch resolution changes into the already-running workers
+through a `multiprocessing.Value` instead of by re-forking.
+
+Three arms, 60 epochs, 40k scenes, otherwise identical (width 32, pool 4, 64
+triangles): fixed 96px, jitter 64/96/128px, jitter 48-160px. All graded first
+on the shared 96px benchmark, `sweep.py`'s standard table:
+
+| trained at | margin@96 | gain@96 | one-shot@96 |
+| --- | --- | --- | --- |
+| fixed 96px | **3.22** | **6.82** | **21.90** |
+| jitter 64/96/128 | 3.06 | 6.65 | 21.74 |
+| jitter 48-160 | 2.96 | 6.45 | 21.64 |
+
+On shared home turf, jitter costs a little — 0.16 to 0.26 dB of margin versus
+training at 96px alone, roughly in proportion to how wide the jitter range is.
+That is the expected price of spreading one fixed epoch budget across more
+resolutions instead of concentrating it at one.
+
+The real question — does jitter training actually transfer better? — needs
+evaluating each checkpoint away from 96px too, which is not what `sweep.py`
+does automatically: its "native" column only re-evaluates when a run's base
+`--size` differs from the benchmark's, and here it's 96 for all three configs
+(`--sizes` varies the *training* resolution, not the `--size` flag), so
+margin equals native trivially and says nothing about transfer. Evaluating all
+three checkpoints at 64px and 128px directly:
+
+| margin (dB over flat colour) | 64px | 96px | 128px |
+| --- | --- | --- | --- |
+| fixed 96px | -1.94 | **3.22** | -0.44 |
+| jitter 64/96/128 | **-0.22** | 3.06 | **-0.09** |
+| jitter 48-160 | -1.01 | 2.96 | -0.20 |
+
+Jitter training helps, measurably. At 64px, jitter 64/96/128 closes 1.72 dB of
+the gap over fixed-96px (-1.94 -> -0.22); jitter 48-160 closes 0.93 dB. At
+128px the gap is smaller to start and jitter still shrinks it (-0.44 -> -0.09
+and -0.20 respectively).
+
+**It does not close it.** Every arm, including the widest jitter tested, still
+loses to a flat colour fill at both 64px and 128px. Adaptive pooling makes
+varying resolution *possible*; training across resolutions makes it *less
+bad*; nothing tried here makes it *free*. "Trained at one resolution, runs at
+another" is a claim about tensor shapes standing in for a much weaker one
+about accuracy, at every setting measured so far — jittered training included.
+
+One more thing worth recording plainly: narrower jitter (64/96/128) beat wider
+jitter (48-160) at *both* off-resolution points, despite the wide arm's range
+literally containing the eval points too. The likely explanation is training
+density, not range — three sizes concentrate more of a fixed epoch budget at
+exactly 64/96/128 than five sizes spread it across, and the wide arm's 48px and
+160px scenes, which the eval never visits, dilute it further. Widening the
+jitter range is not free either.
+
+This also puts the earlier invalid table in context: the corrected
+`jitter 64/96/128` run scores 3.06 dB margin at 96px, nothing like the invalid
+run's -0.37 — a swing attributable entirely to the checkpoint-selection bug the
+invalid attempt was measuring through, not to anything about resolution jitter.
+
 ## Refinement rate: hypothesis rejected
 
 Every refinement trace loses ground on its first step — 23.23 -> 22.21 before

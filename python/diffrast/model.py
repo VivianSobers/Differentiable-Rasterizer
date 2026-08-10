@@ -89,7 +89,15 @@ class TriangleNet(nn.Module):
         # that it is *not* a statement about accuracy. Measured: a model
         # trained at 128px scored +4.44 dB of margin over baseline at 128px
         # and -1.17 dB at 96px, from the same weights. The shapes fit; the
-        # model does not transfer. Train with `--sizes` if you need it to.
+        # model does not transfer.
+        #
+        # `--sizes` narrows that gap but does not close it. A model trained
+        # only at 96px scores -1.94 dB at 64px and -0.44 dB at 128px — both
+        # below a flat colour fill. Jittering across 64/96/128px during
+        # training improves both ends (-0.22 dB and -0.09 dB) and stays
+        # positive at its own centre (96px, +3.06 dB), but every arm tested,
+        # including a wider 48-160px jitter, still loses to the baseline away
+        # from ~96px. See docs/AMORTIZED.md for the full table.
         #
         # The size matters enormously, and pooling to 1x1 — the obvious choice,
         # and what this was — is close to the worst possible one *for this
