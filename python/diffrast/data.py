@@ -14,6 +14,7 @@ guarantee, which makes them a poor first signal.
 
 from __future__ import annotations
 
+import multiprocessing as mp
 from pathlib import Path
 
 import torch
@@ -89,12 +90,20 @@ class SyntheticShapeDataset(Dataset):
         triangles: int = 32,
         sigma: float = 0.004,
         seed: int = 0,
+        size_value: "mp.sharedctypes.Synchronized | None" = None,
     ) -> None:
         self.length = length
         self.size = size
         self.triangles = triangles
         self.sigma = sigma
         self.seed = seed
+        # Set by `train.py --sizes` so persistent DataLoader workers can pick
+        # up a per-epoch resolution change without being re-forked. Mutating
+        # `self.size` on the main process's copy would never reach a worker
+        # that already exists — each has its own copy from fork time — but a
+        # `multiprocessing.Value` lives in memory shared across the fork, so
+        # writing to it here is visible to every worker immediately.
+        self.size_value = size_value
 
     def __len__(self) -> int:
         return self.length
@@ -102,14 +111,15 @@ class SyntheticShapeDataset(Dataset):
     def __getitem__(self, index: int) -> Tensor:
         from .torch_layer import random_params, rasterize
 
+        size = self.size_value.value if self.size_value is not None else self.size
         gen = torch.Generator().manual_seed(self.seed * 1_000_003 + index)
         params = random_params(1, self.triangles, generator=gen)
         background = torch.rand(3, generator=gen) * 0.3
         with torch.no_grad():
             image = rasterize(
                 params,
-                self.size,
-                self.size,
+                size,
+                size,
                 sigma=self.sigma,
                 background=tuple(background.tolist()),
             )

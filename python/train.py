@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -194,6 +195,14 @@ def main() -> int:
     dataset = build_dataset(args)
     triangles = getattr(dataset, "triangles", args.triangles)
 
+    # Shared across the fork so persistent workers can pick up a per-epoch
+    # resolution change without being re-forked — see the note on
+    # `persistent_workers` below for why re-forking is the thing to avoid.
+    size_value = None
+    if args.sizes:
+        size_value = mp.Value("i", args.sizes[0])
+        dataset.size_value = size_value
+
     # Without --pretrain there is no parameter-supervision term, so the render
     # loss is the *only* loss and a fractional render silently throws most of
     # each batch away. Cheap to get wrong, invisible in the loss curve, and it
@@ -217,10 +226,22 @@ def main() -> int:
         num_workers=args.workers,
         pin_memory=device.type == "cuda",
         drop_last=True,
-        # Persistent workers hold their own copy of the dataset, so a
-        # resolution change in the parent would never reach them.
-        persistent_workers=args.workers > 0 and not args.sizes,
+        # Workers are forked once and never again; a resolution change under
+        # `--sizes` reaches them through `size_value`, a `multiprocessing.Value`
+        # in memory shared across the fork, rather than through re-forking.
+        persistent_workers=args.workers > 0,
     )
+    if args.workers > 0:
+        # Fork the workers now, before anything below touches the
+        # rasterizer's GPU/wgpu context. `SyntheticShapeDataset.__getitem__`
+        # forks safely today because the parent hasn't used wgpu yet; the
+        # validation build below and every training step do use it, and
+        # forking *after* that deadlocks the child on a lock the parent's
+        # (now-absent) other thread was holding. Reproduced reliably with
+        # `--sizes` (which used to re-fork every epoch, guaranteeing a fork
+        # after wgpu use) — persistent workers plus this one early fork
+        # avoid it entirely.
+        next(iter(loader))
 
     model = TriangleNet(triangles=triangles, width=args.width, pool=args.pool).to(device)
     if is_main:
@@ -308,6 +329,7 @@ def main() -> int:
         if args.sizes:
             chosen = args.sizes[torch.randint(len(args.sizes), (1,)).item()]
             dataset.size = chosen
+            size_value.value = chosen
             if is_main:
                 print(f"  epoch {epoch}: training at {chosen}px")
 
