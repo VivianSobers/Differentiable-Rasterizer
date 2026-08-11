@@ -1,8 +1,19 @@
 # Session summary — 2026-08-10/11
 
+> **Correction, verified 2026-08-11.** As first written this file cited three
+> commit hashes that do not exist in the repository (`5b1751e`, `1e9f2ce`,
+> `71bc01e`), gave the commit count as eleven when it is twelve, and named a
+> final commit the `v0.3.0` tag does not point at. The hashes below are the
+> real ones. Everything else here was re-checked against the repository and
+> holds: the code, the tests (86 Rust, 65 Python, clippy and fmt clean),
+> `docs/gpu-report.txt`, `python/export_stl10.py` and `--init-from` are all
+> present and pass. The experimental results were unaffected — this was
+> provenance metadata written from memory rather than from `git log`, which is
+> exactly the failure mode the rest of these documents exist to guard against.
+
 Overnight autonomous session on a shared RTX 4090 box. Started from `6139e20`
 (README + AMORTIZED.md up to date through the diversity/refinement-rate
-sweeps), ended at `5b1751e`, tagged `v0.3.0`. Eleven commits, all real —
+sweeps), ended at `bc1380f`, tagged `v0.3.0`. Twelve commits, all real —
 nothing padded or split to inflate the count.
 
 ## What was run, and what each result was
@@ -20,7 +31,7 @@ deadlock, not present in the prior invalid run: `--sizes` re-forks its
 DataLoader every epoch, and by then the main process has already used the GPU
 rasterizer — every training step does — so the fork inherits a half-locked
 wgpu context and hangs on the very first batch. Reproduced reliably with a
-30-second smoke test, fixed (`1e9f2ce`) by forking workers once, before
+30-second smoke test, fixed (`1de5972`) by forking workers once, before
 anything touches the GPU, and passing per-epoch resolution changes through a
 `multiprocessing.Value` instead of by re-forking.
 
@@ -55,7 +66,7 @@ command silently fine-tuned for zero epochs (`--resume` restores the OneCycle
 schedule too, and the pretrain run had already completed every step of its
 own schedule, so there was nothing left to anneal); and the first fine-tune
 attempt crashed outright from a `--triangles` default mismatch against the
-checkpoint's head layer. Added `--init-from` (`71bc01e`) — loads weights only,
+checkpoint's head layer. Added `--init-from` (`7092e77`) — loads weights only,
 starts a fresh optimizer/schedule/epoch-counter — and fixed the RUNBOOK
 example that never actually wired the pretrained weights in.
 
