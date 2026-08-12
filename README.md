@@ -236,20 +236,6 @@ curvature rather than slope. The tests use 5e-4.
 
 ---
 
-## What is not solved
-
-Kept here deliberately — a project that reports only its wins is not reporting.
-
-- **Resolution transfer fails.** A model trained at 128px scores +4.44 dB at
-  128px and **−1.17 dB at 96px**, from the same weights. Training across
-  resolutions (`--sizes`) narrows the gap and does not close it.
-- **Mirror response drops to 0.59 on photographs** from 0.90 on synthetic
-  scenes. The model leans harder on colour statistics than on spatial layout for
-  real images, and whether that is the pooled head's known layout-blindness or a
-  genuinely different strategy is undiagnosed.
-- **Tiled binning** is the only remaining GPU lever, and only because everything
-  around dispatch got cheaper — it is now 61% of a backward call, up from 15%.
-
 Further reading: **[docs/GPU.md](docs/GPU.md)** ·
 **[docs/AMORTIZED.md](docs/AMORTIZED.md)** ·
 **[docs/RUNBOOK.md](docs/RUNBOOK.md)** · **[docs/SESSION.md](docs/SESSION.md)**
